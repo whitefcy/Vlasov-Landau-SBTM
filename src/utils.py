@@ -780,10 +780,16 @@ def compute_window_params(N, eta, box_length, bucket_size=100, safety_factor=1.2
 
 @jax.jit
 def A_apply(dv, ds, gamma, eps=1e-14):
-    v2 = jnp.sum(dv * dv, axis=-1, keepdims=True) + eps
-    vg = v2 ** (gamma / 2)
+    # v2 = jnp.sum(dv * dv, axis=-1, keepdims=True) + eps
+    # vg = v2 ** (gamma / 2)
+    # dvds = jnp.sum(dv * ds, axis=-1, keepdims=True)
+    # return vg * (v2 * ds - dvds * dv)
+    r2 = jnp.sum(dv * dv, axis=-1, keepdims=True)
+    r2_safe = r2 + eps
+    vg = r2_safe ** (gamma / 2)
     dvds = jnp.sum(dv * ds, axis=-1, keepdims=True)
-    return vg * (v2 * ds - dvds * dv)
+
+    return vg * (r2 * ds - dvds * dv)
 
 @partial(jax.jit, static_argnames=['window_size'])
 def collision_rolling(x, v, s, eta, gamma, box_length, w, window_size):

@@ -167,7 +167,11 @@ def main():
         raise ValueError(
             f"final_time ({final_time}) must be an integer multiple of dt ({dt})"
         )
+    initial_electric_energy = 0.5 * jnp.sum(E ** 2) * eta
+    initial_kinetic_energy = 0.5 * jnp.mean(jnp.sum(v ** 2, axis=1)) * L
+    initial_total_energy = initial_kinetic_energy + initial_electric_energy
     E_L2 = [jnp.sqrt(jnp.sum(E ** 2) * eta)]
+    relative_total_energy_errors = [0.0]
     problematic_particle_counts = [0]
 
     print(
@@ -307,9 +311,13 @@ def main():
         momentum = jnp.mean(v, axis=0)
         kinetic_energy = 0.5 * jnp.mean(jnp.sum(v ** 2, axis=1)) * L
         total_energy = kinetic_energy + electric_energy
+        relative_total_energy_error = jnp.abs(
+            total_energy - initial_total_energy
+        ) / jnp.abs(initial_total_energy)
         E_norm = jnp.sqrt(electric_energy)
 
         E_L2.append(E_norm)
+        relative_total_energy_errors.append(float(relative_total_energy_error))
         problematic_particle_counts.append(problematic_particle_count)
         if completed_step % args.log_every == 0:
             elapsed = time.perf_counter() - start_time
@@ -323,6 +331,7 @@ def main():
                 "electric_energy": float(electric_energy),
                 "kinetic_energy": float(kinetic_energy),
                 "total_energy": float(total_energy),
+                "relative_total_energy_error": float(relative_total_energy_error),
                 "problematic_particle_count": problematic_particle_count,
                 "entropy_production": float(entropy_production),
                 "score_mse": score_mse,
@@ -406,6 +415,43 @@ def main():
     )
     snap_art.add_file(snapshots_raw_path)
     wandb.log_artifact(snap_art)
+
+    # Relative total-energy error on a logarithmic y-axis
+    energy_error_time_grid = np.arange(num_steps + 1) * dt
+    energy_error_floor = np.finfo(np.float32 if args.fp32 else np.float64).eps
+    displayed_energy_errors = np.maximum(
+        np.asarray(relative_total_energy_errors),
+        energy_error_floor,
+    )
+
+    fig_energy_error = plt.figure(figsize=(6, 4))
+    plt.semilogy(
+        energy_error_time_grid,
+        displayed_energy_errors,
+        marker="o",
+        ms=2,
+    )
+    plt.xlabel("Time")
+    plt.ylabel(r"Relative total-energy error $|\mathcal{E}(t)-\mathcal{E}(0)|/|\mathcal{E}(0)|$")
+    plt.title(f"Total-energy error, {args.time_integrator}")
+    plt.grid(True, which="both")
+    plt.tight_layout()
+
+    outdir_energy_error = "data/plots/total_energy_error/"
+    os.makedirs(outdir_energy_error, exist_ok=True)
+    fname_energy_error = (
+        f"total_energy_error_n{n:.0e}_M{M}_dt{dt}_{score_method}_"
+        f"dv{dv}_C{C}_{args.time_integrator}.png"
+    )
+    path_energy_error = os.path.join(outdir_energy_error, fname_energy_error)
+    plt.savefig(path_energy_error)
+    wandb.log(
+        {"total_energy_error": wandb.Image(fig_energy_error)},
+        step=num_steps + 1,
+    )
+    wandb.save(path_energy_error)
+    plt.show()
+    plt.close(fig_energy_error)
 
     # Problematic Gamma correction count
     problematic_time_grid = np.arange(num_steps + 1) * dt
