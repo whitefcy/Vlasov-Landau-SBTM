@@ -13,6 +13,7 @@ DV=3
 M=100
 ALPHA=0.1
 FINAL_TIME=15.0
+TIME_INTEGRATOR=energy_conserving
 
 N_VALUES=(500000 1000000 3000000)
 SCORE_METHODS=(sbtm)
@@ -38,8 +39,9 @@ srun python3 experiments/vlasov-landau-damping.py \
   --dt 0.02 \
   --dv "$DV" \
   --C "$C" \
+  --time_integrator "$TIME_INTEGRATOR" \
   --score_method "$score_method" \
   --wandb_project vlasov_landau_damping \
-  --wandb_run_name "alpha${ALPHA}_T${FINAL_TIME}_n${n}_M${M}_dt0.02_dv${DV}_C${C}_${score_method}_100_steps" \
+  --wandb_run_name "alpha${ALPHA}_T${FINAL_TIME}_n${n}_M${M}_dt0.02_dv${DV}_C${C}_${score_method}_${TIME_INTEGRATOR}_100_steps" \
   --alpha "$ALPHA" \
   --final_time "$FINAL_TIME"

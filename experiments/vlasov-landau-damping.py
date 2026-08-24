@@ -30,6 +30,13 @@ def parse_args():
     p.add_argument("--n", type=int, default=10**6, help="Number of particles")
     p.add_argument("--M", type=int, default=100, help="Number of spatial cells")
     p.add_argument("--dt", type=float, default=0.02, help="Time step")
+    p.add_argument(
+        "--time_integrator",
+        type=str,
+        default="forward_euler",
+        choices=["forward_euler", "energy_conserving"],
+        help="Particle/field/collision time integrator",
+    )
     p.add_argument("--gpu", type=int, default=0, help="CUDA_VISIBLE_DEVICES index")
     p.add_argument("--fp32", action="store_true", help="Use float32 instead of float64")
     p.add_argument("--dv", type=int, default=2, help="Velocity dimension")
@@ -154,13 +161,19 @@ def main():
     plt.close(fig_init)
 
     final_time = args.final_time
-    num_steps = int(final_time / dt)
-    t = 0.0
+    steps_float = final_time / dt
+    num_steps = int(round(steps_float))
+    if not np.isclose(steps_float, num_steps, rtol=1e-10, atol=1e-12):
+        raise ValueError(
+            f"final_time ({final_time}) must be an integer multiple of dt ({dt})"
+        )
     E_L2 = [jnp.sqrt(jnp.sum(E ** 2) * eta)]
+    problematic_particle_counts = [0]
 
     print(
         f"Landau Damping with n={n:.0e}, M={M}, dt={dt}, eta={float(eta):.4f}, "
-        f"score_method={score_method}, dv={dv}, C={C}, alpha={alpha}, gpu={args.gpu}, fp32={args.fp32}"
+        f"score_method={score_method}, time_integrator={args.time_integrator}, "
+        f"dv={dv}, C={C}, alpha={alpha}, gpu={args.gpu}, fp32={args.fp32}"
     )
 
     # Quiver of scores before time stepping
@@ -188,11 +201,83 @@ def main():
     snapshot_steps = set(int(round(T / dt)) for T in snapshot_times)
 
     x_traj, v_traj, t_traj = [], [], []
-    start_time = time.perf_counter()
-    for istep in tqdm(range(num_steps + 1)):
-        x, v, E = utils.vlasov_step(x, v, E, cells, eta, dt, L, w)
+    if 0 in snapshot_steps:
+        x_traj.append(np.asarray(x.block_until_ready()))
+        v_traj.append(np.asarray(v.block_until_ready()))
+        t_traj.append(0.0)
+        snapshot_steps.remove(0)
 
-        if C > 0:
+    start_time = time.perf_counter()
+    for istep in tqdm(range(num_steps)):
+        completed_step = istep + 1
+        gamma_squared_min = None
+        problematic_particle_count = 0
+
+        if args.time_integrator == "energy_conserving":
+            def collision_evaluator(x_stage, v_stage, stage):
+                if score_method == "sbtm":
+                    key = jr.fold_in(jr.PRNGKey(seed), 3 * istep + stage)
+                    utils.train_score_model(
+                        model,
+                        optimizer,
+                        x_stage,
+                        v_stage,
+                        key,
+                        batch_size=training_config["batch_size"],
+                        num_batch_steps=training_config["num_batch_steps"],
+                    )
+                    s_stage = model(x_stage, v_stage)
+                else:
+                    s_stage = score_fn(x_stage, v_stage, cells, eta)
+                Q_stage = utils.collision(
+                    x_stage, v_stage, s_stage, eta, gamma, L, w
+                )
+                return s_stage, Q_stage
+
+            (
+                x,
+                v,
+                E,
+                stage_results,
+                gamma_squared,
+                problematic_particles,
+                x_collision,
+                v_collision,
+            ) = utils.energy_conserving_step(
+                x,
+                v,
+                E,
+                cells,
+                eta,
+                dt,
+                L,
+                w,
+                C,
+                collision_evaluator=collision_evaluator if C > 0 else None,
+            )
+            gamma_squared_min = float(jnp.min(gamma_squared))
+            problematic_particle_count = int(jnp.sum(problematic_particles))
+
+            if C > 0:
+                s, Q = stage_results[-1]
+                score_mse = float(
+                    jnp.mean(jnp.sum((s - (-v_collision)) ** 2, axis=1))
+                )
+                if completed_step % args.mse_every == 0:
+                    Q_gaussian = utils.collision(
+                        x_collision, v_collision, -v_collision, eta, gamma, L, w
+                    )
+                    flow_mse = float(
+                        jnp.mean(jnp.sum((Q - Q_gaussian) ** 2, axis=1))
+                    )
+                entropy_production = jnp.mean(jnp.sum(s * C * Q, axis=1))
+            else:
+                entropy_production = 0.0
+                score_mse = 0.0
+        else:
+            x, v, E = utils.vlasov_step(x, v, E, cells, eta, dt, L, w)
+
+        if args.time_integrator == "forward_euler" and C > 0:
             if score_method == "sbtm":
                 s = model(x, v)
                 key = jr.PRNGKey(istep)
@@ -209,12 +294,12 @@ def main():
                 s = score_fn(x, v, cells, eta)
             Q = utils.collision(x, v, s, eta, gamma, L, w)
             score_mse = float(jnp.mean(jnp.sum((s - (-v)) ** 2, axis=1)))
-            if (istep + 1) % args.mse_every == 0:
+            if completed_step % args.mse_every == 0:
                 Q_gaussian = utils.collision(x, v, -v, eta, gamma, L, w)
                 flow_mse = float(jnp.mean(jnp.sum((Q - Q_gaussian) ** 2, axis=1)))
             v = v - dt * C * Q
             entropy_production = jnp.mean(jnp.sum(s * C * Q, axis=1))
-        else:
+        elif args.time_integrator == "forward_euler":
             entropy_production = 0.0
             score_mse = 0.0
 
@@ -225,36 +310,40 @@ def main():
         E_norm = jnp.sqrt(electric_energy)
 
         E_L2.append(E_norm)
-        if (istep + 1) % args.log_every == 0:
+        problematic_particle_counts.append(problematic_particle_count)
+        if completed_step % args.log_every == 0:
             elapsed = time.perf_counter() - start_time
-            steps_per_sec = (istep + 1) / elapsed
+            steps_per_sec = completed_step / elapsed
             mom_dict = {f"momentum/{i+1}": float(m) for i, m in enumerate(momentum)}
             log_dict = {
-                "step": istep + 1,
-                "time": float((istep + 1) * dt),
+                "step": completed_step,
+                "time": float(completed_step * dt),
                 "steps_per_sec": steps_per_sec,
                 "E_L2": float(E_norm),
                 "electric_energy": float(electric_energy),
                 "kinetic_energy": float(kinetic_energy),
                 "total_energy": float(total_energy),
+                "problematic_particle_count": problematic_particle_count,
                 "entropy_production": float(entropy_production),
                 "score_mse": score_mse,
                 **mom_dict,
             }
-            if C > 0 and (istep + 1) % args.mse_every == 0:
+            if gamma_squared_min is not None:
+                log_dict["gamma_squared_min"] = gamma_squared_min
+            if C > 0 and completed_step % args.mse_every == 0:
                 log_dict["flow_mse"] = flow_mse
             wandb.log(
                 log_dict,
-                step=istep + 1,
+                step=completed_step,
             )
         
         # snapshots
-        if istep in snapshot_steps:
+        if completed_step in snapshot_steps:
             x_host = np.asarray(x.block_until_ready())
             v_host = np.asarray(v.block_until_ready())
             x_traj.append(x_host)
             v_traj.append(v_host)
-            t_traj.append(istep * dt)
+            t_traj.append(completed_step * dt)
 
             if score_method == "sbtm":
                 s = model(x, v)
@@ -263,13 +352,13 @@ def main():
             Q = utils.collision(x, v, s, eta, gamma, L, w)
 
             fig_quiver_score_snap = utils.plot_score_quiver_pred(
-                v, s, label=f"{score_method}, t={istep * dt:.2f}", scale=args.score_quiver_scale
+                v, s, label=f"{score_method}, t={completed_step * dt:.2f}", scale=args.score_quiver_scale
             )
-            wandb.log({"score_quiver": wandb.Image(fig_quiver_score_snap)}, step=istep+1)
+            wandb.log({"score_quiver": wandb.Image(fig_quiver_score_snap)}, step=completed_step)
             plt.close(fig_quiver_score_snap)
             
-            fig_quiver_flow_snap = utils.plot_U_quiver_pred(v, -Q, label=f"{score_method}, t={istep * dt:.2f}", scale=args.flow_quiver_scale)
-            wandb.log({"flow_quiver": wandb.Image(fig_quiver_flow_snap)}, step=istep+1)
+            fig_quiver_flow_snap = utils.plot_U_quiver_pred(v, -Q, label=f"{score_method}, t={completed_step * dt:.2f}", scale=args.flow_quiver_scale)
+            wandb.log({"flow_quiver": wandb.Image(fig_quiver_flow_snap)}, step=completed_step)
             plt.close(fig_quiver_flow_snap)
 
 
@@ -318,12 +407,44 @@ def main():
     snap_art.add_file(snapshots_raw_path)
     wandb.log_artifact(snap_art)
 
+    # Problematic Gamma correction count
+    problematic_time_grid = np.arange(num_steps + 1) * dt
+    fig_problematic = plt.figure(figsize=(6, 4))
+    plt.plot(
+        problematic_time_grid,
+        problematic_particle_counts,
+        marker="o",
+        ms=2,
+    )
+    plt.xlabel("Time")
+    plt.ylabel("Number of problematic particles")
+    plt.title(f"Problematic Gamma corrections, {args.time_integrator}")
+    plt.grid(True)
+    plt.tight_layout()
+
+    outdir_problematic = "data/plots/problematic_particles/"
+    os.makedirs(outdir_problematic, exist_ok=True)
+    fname_problematic = (
+        f"problematic_particles_n{n:.0e}_M{M}_dt{dt}_{score_method}_"
+        f"dv{dv}_C{C}_{args.time_integrator}.png"
+    )
+    path_problematic = os.path.join(outdir_problematic, fname_problematic)
+    plt.savefig(path_problematic)
+    wandb.log(
+        {"problematic_particles": wandb.Image(fig_problematic)},
+        step=num_steps + 1,
+    )
+    wandb.save(path_problematic)
+    plt.show()
+    plt.close(fig_problematic)
+
     # Post-processing: Landau damping fit
-    t_grid = jnp.linspace(0, final_time, num_steps + 2)
+    t_grid = jnp.arange(num_steps + 1) * dt
     
     # Limit theoretical predictions to t=15
     t_theory_max = 15.0
-    t_grid_theory = jnp.linspace(0, min(t_theory_max, final_time), int(min(t_theory_max, final_time) / dt) + 2)
+    theory_num_steps = int(np.floor(min(t_theory_max, final_time) / dt + 1e-12))
+    t_grid_theory = jnp.arange(theory_num_steps + 1) * dt
 
     fig_final = plt.figure(figsize=(6, 4))
     plt.plot(t_grid, E_L2, marker="o", ms=1, label=f"Simulation (C={C})")

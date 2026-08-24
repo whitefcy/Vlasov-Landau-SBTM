@@ -500,6 +500,91 @@ def vlasov_step(x, v, E, cells, eta, dt, box_length, w):
     return x, v, E
 
 
+def energy_conserving_step(
+    x,
+    v,
+    E,
+    cells,
+    eta,
+    dt,
+    box_length,
+    w,
+    collision_strength,
+    collision_evaluator=None,
+):
+    """Energy-conserving electrostatic particle/field step.
+
+    This is scheme (3.7) specialized to q=1 and B_ext=0. When collisions
+    are enabled, ``collision_evaluator(x_stage, v_stage, stage)`` must return
+    ``(score, U)`` and is called at the three velocity stages n, **, and *.
+    This function is not jitted because the evaluator may train a score model
+    between stages; its array-valued building blocks are jitted.
+    """
+    half_dt = 0.5 * dt
+    x_star = jnp.mod(x + half_dt * v[:, 0], box_length)
+    stage_results = []
+
+    def evaluate_collision(v_stage, stage):
+        if collision_strength <= 0:
+            return jnp.zeros_like(v_stage)
+        if collision_evaluator is None:
+            raise ValueError("collision_evaluator is required when collision_strength > 0")
+        score, U = collision_evaluator(x_star, v_stage, stage)
+        stage_results.append((score, U))
+        return U
+
+    # U(x*, v^n) and the first particle/field half-step.
+    U_n = evaluate_collision(v, 0)
+    E_n_at_star = evaluate_field_at_particles(E, x_star, cells, eta)
+    v_starstar = v - half_dt * collision_strength * U_n
+    v_starstar = v_starstar.at[:, 0].add(half_dt * E_n_at_star)
+    E_star = update_electric_field(
+        E, x_star, v_starstar, cells, eta, w, half_dt
+    )
+
+    # U(x*, v**) and the second particle half-step.
+    U_starstar = evaluate_collision(v_starstar, 1)
+    E_star_at_star = evaluate_field_at_particles(E_star, x_star, cells, eta)
+    v_star = v - half_dt * collision_strength * U_starstar
+    v_star = v_star.at[:, 0].add(half_dt * E_star_at_star)
+
+    x_new = jnp.mod(x + dt * v_star[:, 0], box_length)
+    E_new = update_electric_field(E, x_star, v_star, cells, eta, w, dt)
+
+    # U(x*, v*) and the full-step provisional velocity.
+    U_star = evaluate_collision(v_star, 2)
+    E_half_at_star = evaluate_field_at_particles(
+        0.5 * (E + E_new), x_star, cells, eta
+    )
+    v_dagger = v - dt * collision_strength * U_star
+    v_dagger = v_dagger.at[:, 0].add(dt * E_half_at_star)
+
+    # Per-particle Gamma correction in scheme (3.7).
+    delta_v = v_dagger - v
+    energy_direction = v_star - 0.5 * (v_dagger + v)
+    speed_squared = jnp.sum(v_dagger ** 2, axis=1)
+    correction = 2.0 * jnp.sum(delta_v * energy_direction, axis=1)
+    gamma_squared = jnp.where(
+        speed_squared > jnp.finfo(v.dtype).tiny,
+        1.0 + correction / speed_squared,
+        1.0,
+    )
+    problematic_particles = (~jnp.isfinite(gamma_squared)) | (gamma_squared < 0.0)
+    safe_gamma_squared = jnp.where(problematic_particles, 1.0, gamma_squared)
+    v_new = jnp.sqrt(safe_gamma_squared)[:, None] * v_dagger
+
+    return (
+        x_new,
+        v_new,
+        E_new,
+        stage_results,
+        gamma_squared,
+        problematic_particles,
+        x_star,
+        v_star,
+    )
+
+
 #------------------------------------------------------------------------------
 # KDE in phase space and Landau collision
 #------------------------------------------------------------------------------
