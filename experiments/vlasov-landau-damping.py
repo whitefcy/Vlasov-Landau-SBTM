@@ -239,7 +239,7 @@ def main():
                 v,
                 E,
                 stage_results,
-                gamma_squared,
+                raw_gamma_squared,
                 problematic_particles,
                 x_collision,
                 v_collision,
@@ -255,7 +255,7 @@ def main():
                 C,
                 collision_evaluator=collision_evaluator if C > 0 else None,
             )
-            gamma_squared_min = float(jnp.min(gamma_squared))
+            gamma_squared_min = float(jnp.min(raw_gamma_squared))
             problematic_particle_count = int(jnp.sum(problematic_particles))
 
             if C > 0:

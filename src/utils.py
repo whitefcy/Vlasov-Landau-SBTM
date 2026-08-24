@@ -564,13 +564,23 @@ def energy_conserving_step(
     energy_direction = v_star - 0.5 * (v_dagger + v)
     speed_squared = jnp.sum(v_dagger ** 2, axis=1)
     correction = 2.0 * jnp.sum(delta_v * energy_direction, axis=1)
-    gamma_squared = jnp.where(
-        speed_squared > jnp.finfo(v.dtype).tiny,
-        1.0 + correction / speed_squared,
+    has_valid_denominator = speed_squared > jnp.finfo(v.dtype).tiny
+    safe_denominator = jnp.where(
+        has_valid_denominator,
+        speed_squared,
         1.0,
     )
-    problematic_particles = (~jnp.isfinite(gamma_squared)) | (gamma_squared < 0.0)
-    safe_gamma_squared = jnp.where(problematic_particles, 1.0, gamma_squared)
+    raw_gamma_squared = 1.0 + correction / safe_denominator
+    problematic_particles = (
+        (~has_valid_denominator)
+        | (~jnp.isfinite(raw_gamma_squared))
+        | (raw_gamma_squared < 0.0)
+    )
+    safe_gamma_squared = jnp.where(
+        problematic_particles,
+        1.0,
+        raw_gamma_squared,
+    )
     v_new = jnp.sqrt(safe_gamma_squared)[:, None] * v_dagger
 
     return (
@@ -578,7 +588,7 @@ def energy_conserving_step(
         v_new,
         E_new,
         stage_results,
-        gamma_squared,
+        raw_gamma_squared,
         problematic_particles,
         x_star,
         v_star,
