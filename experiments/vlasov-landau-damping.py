@@ -6,6 +6,9 @@ import os, sys
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import argparse
+import csv
+import json
+from datetime import datetime
 import time
 
 import jax
@@ -21,6 +24,7 @@ from flax import nnx
 import optax
 
 from src import path, utils, score_model
+from src.adaptive_score import fit_score
 
 #------------------------------------------------------------------------------
 # Main
@@ -33,7 +37,7 @@ def parse_args():
     p.add_argument(
         "--time_integrator",
         type=str,
-        default="forward_euler",
+        default="energy_conserving",
         choices=["forward_euler", "energy_conserving"],
         help="Particle/field/collision time integrator",
     )
@@ -52,6 +56,17 @@ def parse_args():
     p.add_argument("--sbtm_abs_tol", type=float, default=1e-4)
     p.add_argument("--sbtm_lr", type=float, default=2e-4)
     p.add_argument("--sbtm_num_batch_steps", type=int, default=100)
+
+    p.add_argument("--sbtm_adaptive", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--sbtm_div_mode", choices=["exact", "approximate_rademacher"], default="exact")
+    p.add_argument("--sbtm_min_steps", type=int, default=10)
+    p.add_argument("--sbtm_check_every", type=int, default=5)
+    p.add_argument("--sbtm_patience", type=int, default=3)
+    p.add_argument("--sbtm_stop_atol", type=float, default=1e-5)
+    p.add_argument("--sbtm_stop_rtol", type=float, default=1e-4)
+    p.add_argument("--sbtm_monitor_size", type=int, default=2048)
+    p.add_argument("--optimization_output_dir", default=None,
+                   help="Local per-evaluation CSV, configuration, and plot directory")
 
     p.add_argument("--score_quiver_scale", type=float, default=1.0, help="Scale for score quiver plots")
     p.add_argument("--flow_quiver_scale", type=float, default=0.1, help="Scale for flow quiver plots")
@@ -145,7 +160,7 @@ def main():
             except Exception as e:
                 print(f"Warning: could not save model to {model_path}: {e}")
             time.sleep(1)
-        optimizer = nnx.Optimizer(model, optax.adamw(training_config["lr"]))
+        optimizer = nnx.Optimizer(model, optax.adamw(training_config["lr"]), wrt=nnx.Param)
 
         def score_fn(x_in, v_in, cells_in, eta_in):
             return model(x_in, v_in)
@@ -211,6 +226,39 @@ def main():
         t_traj.append(0.0)
         snapshot_steps.remove(0)
 
+    optimization_records = []
+    optimization_dir = args.optimization_output_dir or os.path.join(
+        "data", "optimization", datetime.now().strftime("landau_damping_%Y%m%d_%H%M%S_%f"))
+    if score_method == "sbtm":
+        os.makedirs(optimization_dir, exist_ok=True)
+        if os.path.exists(os.path.join(optimization_dir, "optimization.csv")):
+            raise FileExistsError(f"Choose a fresh optimization_output_dir: {optimization_dir}")
+        with open(os.path.join(optimization_dir, "config.json"), "w") as handle:
+            json.dump(vars(args), handle, indent=2)
+
+    def fit_stage(x_stage, v_stage, istep, stage):
+        diagnostics = fit_score(
+            model, optimizer, x_stage, v_stage,
+            jr.fold_in(jr.PRNGKey(seed), 3 * istep + stage),
+            batch_size=args.sbtm_batch_size, max_steps=args.sbtm_num_batch_steps,
+            adaptive=args.sbtm_adaptive, min_steps=args.sbtm_min_steps,
+            check_every=args.sbtm_check_every, patience=args.sbtm_patience,
+            atol=args.sbtm_stop_atol, rtol=args.sbtm_stop_rtol,
+            monitor_size=args.sbtm_monitor_size, div_mode=args.sbtm_div_mode)
+        record = dict(evaluation=len(optimization_records) + 1,
+                      step=istep + 1, time=(istep + 1) * dt, stage=stage,
+                      stage_name=("n", "starstar", "star")[stage]
+                      if args.time_integrator == "energy_conserving" else "forward_euler",
+                      **diagnostics)
+        optimization_records.append(record)
+        # Append every evaluation, independently of W&B/log_every, surviving interruption.
+        with open(os.path.join(optimization_dir, "optimization.csv"), "a", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=record.keys())
+            if len(optimization_records) == 1:
+                writer.writeheader()
+            writer.writerow(record)
+        return diagnostics
+
     start_time = time.perf_counter()
     for istep in tqdm(range(num_steps)):
         completed_step = istep + 1
@@ -220,16 +268,7 @@ def main():
         if args.time_integrator == "energy_conserving":
             def collision_evaluator(x_stage, v_stage, stage):
                 if score_method == "sbtm":
-                    key = jr.fold_in(jr.PRNGKey(seed), 3 * istep + stage)
-                    utils.train_score_model(
-                        model,
-                        optimizer,
-                        x_stage,
-                        v_stage,
-                        key,
-                        batch_size=training_config["batch_size"],
-                        num_batch_steps=training_config["num_batch_steps"],
-                    )
+                    fit_stage(x_stage, v_stage, istep, stage)
                     s_stage = model(x_stage, v_stage)
                 else:
                     s_stage = score_fn(x_stage, v_stage, cells, eta)
@@ -283,17 +322,8 @@ def main():
 
         if args.time_integrator == "forward_euler" and C > 0:
             if score_method == "sbtm":
+                fit_stage(x, v, istep, 0)
                 s = model(x, v)
-                key = jr.PRNGKey(istep)
-                utils.train_score_model(
-                    model,
-                    optimizer,
-                    x,
-                    v,
-                    key,
-                    batch_size=training_config["batch_size"],
-                    num_batch_steps=training_config["num_batch_steps"],
-                )
             else:
                 s = score_fn(x, v, cells, eta)
             Q = utils.collision(x, v, s, eta, gamma, L, w)
@@ -306,6 +336,15 @@ def main():
         elif args.time_integrator == "forward_euler":
             entropy_production = 0.0
             score_mse = 0.0
+
+        if score_method == "sbtm" and C > 0:
+            stage_records = optimization_records[-(3 if args.time_integrator == "energy_conserving" else 1):]
+            wandb.log({
+                **{f"optimization/stage_{r['stage']}_steps": r["optimization_steps"] for r in stage_records},
+                **{f"optimization/stage_{r['stage']}_loss": r["final_loss"] for r in stage_records},
+                "optimization/total_steps": sum(r["optimization_steps"] for r in stage_records),
+                "optimization/seconds": sum(r["optimization_seconds"] for r in stage_records),
+            }, step=completed_step)
 
         electric_energy = 0.5 * jnp.sum(E ** 2) * eta # electric energy
         momentum = jnp.mean(v, axis=0)
@@ -371,6 +410,23 @@ def main():
             plt.close(fig_quiver_flow_snap)
 
 
+
+    if optimization_records:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        for stage in sorted({r["stage"] for r in optimization_records}):
+            rows = [r for r in optimization_records if r["stage"] == stage]
+            ax.plot([r["step"] for r in rows], [r["optimization_steps"] for r in rows],
+                    marker=".", label=rows[0]["stage_name"])
+        ax.axhline(args.sbtm_num_batch_steps, color="black", linestyle="--", label="Fixed-step budget")
+        ax.set(xlabel="Time update", ylabel="Optimizer updates per score evaluation",
+               title="Landau damping: score optimization by stage")
+        ax.legend()
+        ax.grid(alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(os.path.join(optimization_dir, "optimization_steps.png"), dpi=160)
+        wandb.log({"optimization/steps_plot": wandb.Image(fig)}, step=num_steps + 1)
+        plt.close(fig)
+        print(f"Optimization diagnostics: {optimization_dir}")
 
     # Phase-space snapshots
     title = fr"Landau damping α={alpha}, k={k}, C={C}, n={n:.0e}, M={M}, Δt={dt}, {score_method}"

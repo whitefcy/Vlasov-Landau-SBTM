@@ -56,6 +56,9 @@ class MLPScoreModel(nnx.Module):
             input_dim = hidden_dim
         
         self.final_layer = nnx.Linear(input_dim, dv, rngs=rngs, dtype=self.dtype)
+        # Flax >=0.12 requires containers of layers to be marked as data.
+        if hasattr(nnx, 'data'):
+            self.layers = nnx.data(self.layers)
     
     def __call__(self, x, v):
         """Compute the score using an MLP network.

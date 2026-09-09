@@ -118,15 +118,25 @@ def weighted_explicit_score_matching_loss(s, x_batch, v_batch, target_score_valu
     
     return jnp.mean(jax.vmap(weighted_loss)(x_batch, v_batch, target_score_values, weighting))
 
-@nnx.jit(static_argnames='div_mode')
+@nnx.jit(static_argnames=('div_mode', 'n_samples'))
 def implicit_score_matching_loss(s, x_batch, v_batch, key, div_mode='approximate_rademacher', n_samples: int = 1):
     """
-    1/|B| ∑ (‖s(x,v)‖² + 2 div_v s(x,v))     with Hutchinson divergence.
-    One PRNG key → one ε-tensor shared across the batch (still unbiased).
+    1/|B| ∑ (‖s(x,v)‖² + 2 div_v s(x,v)).
+    Exact mode traces the velocity Jacobian; approximate_rademacher uses
+    independent Hutchinson probes per particle. Exact mode ignores key.
     """
-    assert div_mode == 'approximate_rademacher', "Only 'approximate_rademacher' divergence mode is currently implemented"
+    if div_mode not in ('exact', 'approximate_rademacher'):
+        raise ValueError(f"Unsupported divergence mode: {div_mode}")
     if x_batch.ndim < v_batch.ndim:
         x_batch = x_batch[:, None]
+    if div_mode == 'exact':
+        # Hold x fixed: div_v s = sum_j (d s_j / d v_j).
+        # jacfwd uses the dv coordinate directions, with no random probes.
+        def exact_one(x, v):
+            score = s(x, v)
+            jac = jax.jacfwd(lambda vv: s(x, vv))(v)
+            return jnp.sum(score * score) + 2.0 * jnp.trace(jac)
+        return jax.vmap(exact_one)(x_batch, v_batch).mean()
     # ε tensor:  (n_samples, B, dv)
     eps = jax.random.rademacher(key, (n_samples,) + v_batch.shape, dtype=v_batch.dtype)
 

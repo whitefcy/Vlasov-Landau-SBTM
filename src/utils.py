@@ -884,7 +884,10 @@ def ism_loss(model, batch, key):
 @nnx.jit
 def supervised_step(model, optimizer, batch):
     loss_val, grads = nnx.value_and_grad(mse_loss)(model, batch)
-    optimizer.update(grads)
+    if hasattr(optimizer, 'model'):
+        optimizer.update(grads)
+    else:
+        optimizer.update(model, grads)
     return loss_val
 
 @nnx.jit
@@ -894,7 +897,7 @@ def score_step(model, optimizer, batch, key):
     return loss_val
 
 def train_initial_model(model, x, v, score, batch_size, num_epochs, abs_tol, lr, verbose=False, print_every=10):
-    optimizer = nnx.Optimizer(model, optax.adamw(lr))
+    optimizer = nnx.Optimizer(model, optax.adamw(lr), wrt=nnx.Param)
     n = x.shape[0]
     full_loss_hist = []
     for epoch in range(num_epochs):
