@@ -10,6 +10,8 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
+from src.time_integrators import homogeneous_step
+
 
 @jax.jit
 def maxwell_collision(v, score):
@@ -72,6 +74,8 @@ def make_parser(description, *, score_methods=("sbtm", "blob", "exact")):
     p.add_argument("--t0", type=float, default=5.5)
     p.add_argument("--final_time", type=float, default=9.5, help="Physical end time, not duration")
     p.add_argument("--dt", type=float, default=0.01)
+    p.add_argument("--time_integrator", choices=["energy_conserving", "forward_euler"],
+                   default="energy_conserving", help="Project energy-conserving scheme or forward Euler")
     p.add_argument("--score_method", choices=score_methods, default="sbtm")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--gpu", default=None, help="Optional CUDA index; otherwise preserve Slurm visibility")
@@ -86,8 +90,12 @@ def make_parser(description, *, score_methods=("sbtm", "blob", "exact")):
     p.add_argument("--sbtm_num_epochs", type=int, default=1000, help="Maximum supervised initialization epochs")
     p.add_argument("--sbtm_abs_tol", type=float, default=1e-4)
     p.add_argument("--sbtm_lr", type=float, default=4e-4)
-    p.add_argument("--sbtm_num_batch_steps", type=int, default=100)
-    p.add_argument("--sbtm_adaptive", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--sbtm_num_batch_steps", type=int, default=100,
+                   help="Optimizer updates per training pass (maximum when adaptive)")
+    p.add_argument("--sbtm_adaptive", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--sbtm_training_stages", choices=["stage0_only", "all_stages"],
+                   default="stage0_only",
+                   help="Train once at step start or at all three energy-conserving stages")
     p.add_argument("--sbtm_div_mode", choices=["exact", "approximate_rademacher"], default="exact")
     p.add_argument("--sbtm_min_steps", type=int, default=10)
     p.add_argument("--sbtm_check_every", type=int, default=5)
@@ -119,6 +127,80 @@ def validate_args(args, p):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             p.error(f"{name} must be finite and nonnegative")
     return args
+
+
+class HomogeneousStepper:
+    """Stage training and score evaluation with an auditable optimization log."""
+
+    def __init__(self, args, model=None, optimizer=None, *, exact_score=None, log_fit=None):
+        self.args = args
+        self.model = model
+        self.optimizer = optimizer
+        self.exact_score = exact_score
+        self.log_fit = log_fit
+        self.optimization_steps = 0
+        self.total_optimization_steps = 0
+        self.training_passes = 0
+        self.total_problematic_particles = 0
+
+    def evaluate(self, v, t):
+        """Evaluate the current score/flow without updating network weights."""
+        if self.args.score_method == "sbtm":
+            s = self.model(jnp.empty((len(v), 0), dtype=v.dtype), v)
+        elif self.args.score_method == "blob":
+            _, s = gaussian_kde(v, v, scott_bandwidth(v), self.args.block_size)
+        elif self.exact_score is not None:
+            s = self.exact_score(v, t)
+        else:
+            raise ValueError("An analytical score function is required for exact mode")
+        return s, maxwell_collision(v, s)
+
+    def prepare(self, v, t, step, stage):
+        if self.args.score_method == "sbtm":
+            if stage == 0 or self.args.sbtm_training_stages == "all_stages":
+                from src.adaptive_score import fit_score
+                a = self.args
+                fit = fit_score(self.model, self.optimizer,
+                                jnp.empty((len(v), 0), dtype=v.dtype), v,
+                                jr.fold_in(jr.PRNGKey(a.seed), 3 * step + stage),
+                                batch_size=a.sbtm_batch_size, max_steps=a.sbtm_num_batch_steps,
+                                adaptive=a.sbtm_adaptive, min_steps=a.sbtm_min_steps,
+                                check_every=a.sbtm_check_every, patience=a.sbtm_patience,
+                                atol=a.sbtm_stop_atol, rtol=a.sbtm_stop_rtol,
+                                monitor_size=a.sbtm_monitor_size, div_mode=a.sbtm_div_mode)
+                self.training_passes += 1
+            else:
+                fit = dict(optimization_steps=0, stop_reason="reused_stage0", initial_loss=None,
+                           final_loss=None, monitor_checks=0, optimization_seconds=0.0)
+            self.optimization_steps += fit["optimization_steps"]
+            self.total_optimization_steps += fit["optimization_steps"]
+            if self.log_fit is not None:
+                self.log_fit(dict(step=step + 1, time=t, stage=stage,
+                                  stage_name=("n", "starstar", "star")[stage]
+                                  if self.args.time_integrator == "energy_conserving" else "forward_euler",
+                                  **fit))
+        # Reevaluate at each stage's velocities, including when weights are reused.
+        return self.evaluate(v, t)
+
+    def start_step(self, v, t, step):
+        self.optimization_steps = 0
+        return self.prepare(v, t, step, 0)
+
+    def advance(self, v, t, dt, step, initial_evaluation):
+        result, _, gamma_squared, problematic = homogeneous_step(
+            v, t, dt, self.args.B, lambda velocity, time, stage: self.prepare(velocity, time, step, stage),
+            time_integrator=self.args.time_integrator, initial_evaluation=initial_evaluation)
+        count = int(jnp.sum(problematic))
+        self.total_problematic_particles += count
+        gamma_min = float(jnp.min(gamma_squared))
+        return result, dict(optimization_steps=self.optimization_steps,
+                            gamma_squared_min=gamma_min if math.isfinite(gamma_min) else None,
+                            problematic_particle_count=count)
+
+    def summary(self):
+        return dict(training_passes=self.training_passes,
+                    total_optimization_steps=self.total_optimization_steps,
+                    total_problematic_particle_count=self.total_problematic_particles)
 
 
 def initialize_model(args, v, key, target):
@@ -165,4 +247,3 @@ def initialize_model(args, v, key, target):
     optimizer = nnx.Optimizer(model, optax.adam(args.sbtm_lr), wrt=nnx.Param)
     return model, optimizer, dict(initial_score_mse=loss, initial_fit_seconds=time.perf_counter() - started,
                                  initial_tolerance_met=loss <= args.sbtm_abs_tol)
-

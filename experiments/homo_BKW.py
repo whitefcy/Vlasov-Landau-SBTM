@@ -4,7 +4,8 @@ Times are physical BKW times: by default t0=5.5, final_time=9.5 (400 steps).
 There are no spatial particles, fields, spatial mollifier, or Coulomb kernel.
 The particle weights are 1/n and the collision prefactor B appears exactly once.
 
-The SBTM mode reuses the repository's exact-divergence/adaptive training. This
+The SBTM mode uses the repository's exact-divergence loss and energy-conserving
+integrator, with 100 fixed optimizer updates at step start by default. This
 differs from the paper's fixed 25 denoising updates with alpha=0.4. The blob
 mode uses the repository's Gaussian-KDE score convention (not the variational
 entropy gradient of every method called "blob" in the literature).
@@ -30,7 +31,7 @@ import jax.random as jr
 import numpy as np
 
 from src.homogeneous import (
-    gaussian_kde, initialize_model, make_parser, maxwell_collision,
+    HomogeneousStepper, gaussian_kde, initialize_model, make_parser, maxwell_collision,
     scott_bandwidth, validate_args,
 )
 
@@ -214,7 +215,7 @@ def main(argv=None):
     outdir.mkdir(parents=True, exist_ok=False)
     os.environ.setdefault("MPLCONFIGDIR", str(outdir.resolve() / ".matplotlib"))
     config = {**vars(args), "output_dir": str(outdir), "device": jax.devices()[0].device_kind,
-              "example": "bkw", "time_integrator": "forward_euler", "gamma": 0, "particle_weight": 1 / args.n,
+              "example": "bkw", "gamma": 0, "particle_weight": 1 / args.n,
               "density_bandwidth": "diagonal Scott: h_i=std(v_i)*n^(-1/(d+4)); covariance=diag(h_i^2)",
               "reference": "IHW25.pdf, Section 5.2, Example 5.1, pp. 1780-1782"}
     (outdir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -224,15 +225,13 @@ def main(argv=None):
         import wandb
         run = wandb.init(project=args.wandb_project, name=name, mode=args.wandb_mode, config=config)
 
-    key, sample_key, init_key = jr.split(jr.PRNGKey(args.seed), 3)
+    _, sample_key, init_key = jr.split(jr.PRNGKey(args.seed), 3)
     v = sample_bkw(sample_key, args.n, args.t0, args.dv, args.B, dtype)
     initial_mean = jnp.mean(v, axis=0)
     initial_energy = 0.5 * jnp.mean(jnp.sum(v**2, axis=1))
-    x = jnp.empty((args.n, 0), dtype=dtype)
     initialization = {}
     model = optimizer = None
     if args.score_method == "sbtm":
-        from src.adaptive_score import fit_score
         model, optimizer, initialization = initialize_model(args, v, init_key, bkw_score(v, args.t0, args.B))
         (outdir / "initialization.json").write_text(json.dumps(initialization, indent=2) + "\n")
 
@@ -242,41 +241,31 @@ def main(argv=None):
     grid = np.linspace(-4, 4, 401)
     points = jnp.zeros((len(grid), args.dv), dtype=dtype).at[:, 0].set(jnp.asarray(grid, dtype=dtype))
     started = time.perf_counter()
+    last_step_metrics = dict(optimization_steps=0, gamma_squared_min=1.0, problematic_particle_count=0)
     with (outdir / "metrics.csv").open("w", newline="") as metrics_file, (outdir / "optimization.csv").open("w", newline="") as optimization_file:
         metric_writer = optimization_writer = None
-        # The final state is also fitted/evaluated for synchronized diagnostics.
+
+        def log_fit(fit):
+            nonlocal optimization_writer
+            if optimization_writer is None:
+                optimization_writer = csv.DictWriter(optimization_file, fieldnames=fit)
+                optimization_writer.writeheader()
+            optimization_writer.writerow(fit)
+            optimization_file.flush()
+
+        stepper = HomogeneousStepper(args, model, optimizer, log_fit=log_fit,
+                                     exact_score=lambda velocity, time: bkw_score(velocity, time, args.B))
         for step in range(num_steps + 1):
             t = min(args.t0 + step * args.dt, args.final_time)
-            optimization_steps = 0
-            if args.score_method == "sbtm":
-                if step > 0:
-                    key, train_key = jr.split(key)
-                    fit = fit_score(model, optimizer, x, v, train_key,
-                                    batch_size=args.sbtm_batch_size, max_steps=args.sbtm_num_batch_steps,
-                                    adaptive=args.sbtm_adaptive, min_steps=args.sbtm_min_steps,
-                                    check_every=args.sbtm_check_every, patience=args.sbtm_patience,
-                                    atol=args.sbtm_stop_atol, rtol=args.sbtm_stop_rtol,
-                                    monitor_size=args.sbtm_monitor_size, div_mode=args.sbtm_div_mode)
-                    fit = {"step": step, "time": t, **fit}
-                    if optimization_writer is None:
-                        optimization_writer = csv.DictWriter(optimization_file, fieldnames=fit)
-                        optimization_writer.writeheader()
-                    optimization_writer.writerow(fit)
-                    optimization_file.flush()
-                    optimization_steps = fit["optimization_steps"]
-                s = model(x, v)
-            elif args.score_method == "blob":
-                _, s = gaussian_kde(v, v, scott_bandwidth(v), args.block_size)
-            else:
-                s = bkw_score(v, t, args.B)
-            collision = maxwell_collision(v, s)
-
+            # Train only for actual transport steps; final diagnostics reuse weights.
+            s, collision = (stepper.start_step(v, t, step) if step < num_steps
+                            else stepper.evaluate(v, t))
             snapshot_due = step % args.snapshot_every == 0 or step == num_steps
             density_due = step % args.density_every == 0 or snapshot_due
             if step % args.log_every == 0 or density_due or step == num_steps:
                 record = dict(step=step, time=t, elapsed_time=t - args.t0,
                               **benchmark_metrics(v, s, collision, t, initial_mean, initial_energy, args.B),
-                              optimization_steps=optimization_steps, density_l2=None, density_relative_l2=None,
+                              **last_step_metrics, density_l2=None, density_relative_l2=None,
                               **{f"density_bandwidth_{i+1}": None for i in range(args.dv)},
                               wall_seconds=0.0)
                 if density_due:
@@ -309,7 +298,7 @@ def main(argv=None):
                                       score_estimated=np.asarray(score_estimated[:, 0]), score_exact=np.asarray(score_exact[:, 0])))
             if step < num_steps:
                 next_time = min(args.t0 + (step + 1) * args.dt, args.final_time)
-                v = v - (next_time - t) * args.B * collision
+                v, last_step_metrics = stepper.advance(v, t, next_time - t, step, (s, collision))
 
     np.savez_compressed(outdir / "snapshots.npz", t_traj=np.array([s["time"] for s in snapshots]),
                         v_traj=np.stack([s["v"] for s in snapshots]), slice_grid=grid,
@@ -317,7 +306,7 @@ def main(argv=None):
                            ["density_estimated", "density_exact", "score_estimated", "score_exact"]})
     save_plots(outdir, records, snapshots, grid)
     summary = {"initialization": initialization, "initial": records[0], "final": records[-1],
-               "num_steps": num_steps, "simulation_wall_seconds": time.perf_counter() - started}
+               "num_steps": num_steps, "evolution": stepper.summary(), "simulation_wall_seconds": time.perf_counter() - started}
     (outdir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     from src.homogeneous_plots import plot_benchmarks
     plot_benchmarks([dict(config=config, records=records, summary=summary, path=str(outdir))], outdir)
@@ -327,7 +316,7 @@ def main(argv=None):
                  "benchmark": wandb.Image(str(outdir / "benchmark.png")),
                  "density_score_slices": wandb.Image(str(outdir / "density_score_slices.png"))})
         run.finish()
-    print(f"Completed {num_steps} forward Euler steps. Results: {outdir}", flush=True)
+    print(f"Completed {num_steps} {args.time_integrator} steps. Results: {outdir}", flush=True)
     return outdir
 
 

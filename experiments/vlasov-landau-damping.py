@@ -58,6 +58,9 @@ def parse_args():
     p.add_argument("--sbtm_num_batch_steps", type=int, default=100)
 
     p.add_argument("--sbtm_adaptive", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--sbtm_training_stages", choices=["stage0_only", "all_stages"],
+                   default="stage0_only",
+                   help="Train once at step start or at all three energy-conserving stages")
     p.add_argument("--sbtm_div_mode", choices=["exact", "approximate_rademacher"], default="exact")
     p.add_argument("--sbtm_min_steps", type=int, default=10)
     p.add_argument("--sbtm_check_every", type=int, default=5)
@@ -236,15 +239,22 @@ def main():
         with open(os.path.join(optimization_dir, "config.json"), "w") as handle:
             json.dump(vars(args), handle, indent=2)
 
-    def fit_stage(x_stage, v_stage, istep, stage):
-        diagnostics = fit_score(
-            model, optimizer, x_stage, v_stage,
-            jr.fold_in(jr.PRNGKey(seed), 3 * istep + stage),
-            batch_size=args.sbtm_batch_size, max_steps=args.sbtm_num_batch_steps,
-            adaptive=args.sbtm_adaptive, min_steps=args.sbtm_min_steps,
-            check_every=args.sbtm_check_every, patience=args.sbtm_patience,
-            atol=args.sbtm_stop_atol, rtol=args.sbtm_stop_rtol,
-            monitor_size=args.sbtm_monitor_size, div_mode=args.sbtm_div_mode)
+    def prepare_score_stage(x_stage, v_stage, istep, stage):
+        if (args.time_integrator == "energy_conserving"
+                and args.sbtm_training_stages == "stage0_only" and stage != 0):
+            # Reuse weights, not score values: model is evaluated at v_stage below.
+            diagnostics = dict(optimization_steps=0, stop_reason="reused_stage0",
+                               initial_loss=None, final_loss=None, monitor_checks=0,
+                               optimization_seconds=0.0)
+        else:
+            diagnostics = fit_score(
+                model, optimizer, x_stage, v_stage,
+                jr.fold_in(jr.PRNGKey(seed), 3 * istep + stage),
+                batch_size=args.sbtm_batch_size, max_steps=args.sbtm_num_batch_steps,
+                adaptive=args.sbtm_adaptive, min_steps=args.sbtm_min_steps,
+                check_every=args.sbtm_check_every, patience=args.sbtm_patience,
+                atol=args.sbtm_stop_atol, rtol=args.sbtm_stop_rtol,
+                monitor_size=args.sbtm_monitor_size, div_mode=args.sbtm_div_mode)
         record = dict(evaluation=len(optimization_records) + 1,
                       step=istep + 1, time=(istep + 1) * dt, stage=stage,
                       stage_name=("n", "starstar", "star")[stage]
@@ -268,7 +278,7 @@ def main():
         if args.time_integrator == "energy_conserving":
             def collision_evaluator(x_stage, v_stage, stage):
                 if score_method == "sbtm":
-                    fit_stage(x_stage, v_stage, istep, stage)
+                    prepare_score_stage(x_stage, v_stage, istep, stage)
                     s_stage = model(x_stage, v_stage)
                 else:
                     s_stage = score_fn(x_stage, v_stage, cells, eta)
@@ -322,7 +332,7 @@ def main():
 
         if args.time_integrator == "forward_euler" and C > 0:
             if score_method == "sbtm":
-                fit_stage(x, v, istep, 0)
+                prepare_score_stage(x, v, istep, 0)
                 s = model(x, v)
             else:
                 s = score_fn(x, v, cells, eta)
@@ -341,7 +351,7 @@ def main():
             stage_records = optimization_records[-(3 if args.time_integrator == "energy_conserving" else 1):]
             wandb.log({
                 **{f"optimization/stage_{r['stage']}_steps": r["optimization_steps"] for r in stage_records},
-                **{f"optimization/stage_{r['stage']}_loss": r["final_loss"] for r in stage_records},
+                **{f"optimization/stage_{r['stage']}_loss": r["final_loss"] for r in stage_records if r["final_loss"] is not None},
                 "optimization/total_steps": sum(r["optimization_steps"] for r in stage_records),
                 "optimization/seconds": sum(r["optimization_seconds"] for r in stage_records),
             }, step=completed_step)

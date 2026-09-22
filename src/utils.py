@@ -10,6 +10,7 @@ import os
 import math
 
 from src import loss
+from src.time_integrators import gamma_correct_velocity
 from flax import nnx
 import optax
 
@@ -560,28 +561,9 @@ def energy_conserving_step(
     v_dagger = v_dagger.at[:, 0].add(dt * E_half_at_star)
 
     # Per-particle Gamma correction in scheme (3.7).
-    delta_v = v_dagger - v
-    energy_direction = v_star - 0.5 * (v_dagger + v)
-    speed_squared = jnp.sum(v_dagger ** 2, axis=1)
-    correction = 2.0 * jnp.sum(delta_v * energy_direction, axis=1)
-    has_valid_denominator = speed_squared > jnp.finfo(v.dtype).tiny
-    safe_denominator = jnp.where(
-        has_valid_denominator,
-        speed_squared,
-        1.0,
+    v_new, raw_gamma_squared, problematic_particles = gamma_correct_velocity(
+        v, v_star, v_dagger
     )
-    raw_gamma_squared = 1.0 + correction / safe_denominator
-    problematic_particles = (
-        (~has_valid_denominator)
-        | (~jnp.isfinite(raw_gamma_squared))
-        | (raw_gamma_squared < 0.0)
-    )
-    safe_gamma_squared = jnp.where(
-        problematic_particles,
-        1.0,
-        raw_gamma_squared,
-    )
-    v_new = jnp.sqrt(safe_gamma_squared)[:, None] * v_dagger
 
     return (
         x_new,

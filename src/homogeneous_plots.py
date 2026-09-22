@@ -50,10 +50,17 @@ def validate_runs(runs):
     # Training settings may differ between methods; physics/integration may not.
     common = ("example", "dv", "B", "dt", "t0", "final_time", "time_integrator", "fp32", "initial_variances")
     identities = set()
+    training_config = None
     for run in runs:
         config = run["config"]
         if any(config.get(key) != first.get(key) for key in common):
             raise ValueError(f"Incompatible physics/time settings in {run['path']}; plot each configuration separately")
+        if config["score_method"] == "sbtm":
+            training = tuple(config.get(key) for key in
+                             ("sbtm_training_stages", "sbtm_adaptive", "sbtm_num_batch_steps"))
+            if training_config is not None and training != training_config:
+                raise ValueError(f"Incompatible SBTM training settings in {run['path']}; plot each configuration separately")
+            training_config = training
         identity = (config["score_method"], config["n"], config["seed"])
         if identity in identities:
             raise ValueError(f"Duplicate method/n/seed {identity}; select one run, not both retries")
