@@ -34,9 +34,11 @@ srun python3 -u experiments/homo_benchmark.py run \
   --t0 5.5 \
   --final_time 9.5 \
   --dt 0.01 \
+  --time_integrator energy_conserving \
   --sbtm_hidden_dims 100 100 \
   --sbtm_lr 0.0004 \
-  --sbtm_adaptive \
+  --no-sbtm_adaptive \
+  --sbtm_training_stages stage0_only \
   --sbtm_div_mode exact \
   --sbtm_num_batch_steps 100 \
   --density_every 100 \
