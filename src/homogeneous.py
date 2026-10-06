@@ -89,6 +89,9 @@ def make_parser(description, *, score_methods=("sbtm", "blob", "exact"),
     p.add_argument("--snapshot_every", type=int, default=100)
     p.add_argument("--output_dir", type=Path, default=None)
     p.add_argument("--sbtm_hidden_dims", type=int, nargs="+", default=[100, 100])
+    p.add_argument("--sbtm_activation", choices=("soft_sign", "tanh"), default=None,
+                   help="Score-network activation; defaults to tanh for score-evolution transport "
+                        "(which needs second velocity derivatives), otherwise soft_sign")
     p.add_argument("--sbtm_batch_size", type=int, default=1024)
     p.add_argument("--sbtm_n_initial", type=int, default=None,
                    help="Independent particles used only for supervised initial score fitting; "
@@ -121,6 +124,10 @@ def make_parser(description, *, score_methods=("sbtm", "blob", "exact"),
 
 
 def validate_args(args, p):
+    if args.sbtm_activation is None:
+        transport = (args.score_method == "score_evolution"
+                     and getattr(args, "score_evolution_rhs", "kernel") == "transport")
+        args.sbtm_activation = "tanh" if transport else "soft_sign"
     positive = ["B", "dt", "block_size", "log_every", "density_every", "snapshot_every",
                 "sbtm_batch_size", "sbtm_num_epochs", "sbtm_lr", "sbtm_num_batch_steps",
                 "sbtm_min_steps", "sbtm_check_every", "sbtm_patience", "sbtm_monitor_size"]
@@ -233,7 +240,9 @@ def initialize_model(args, v, key, exact_score, *, sample_initial):
         key, sample_key = jr.split(key)
         training_v = sample_initial(sample_key, args.sbtm_n_initial)
     target = exact_score(training_v)
-    model = MLPScoreModel(0, args.dv, hidden_dims=tuple(args.sbtm_hidden_dims), seed=args.seed, dtype=v.dtype)
+    activation = {"soft_sign": nnx.soft_sign, "tanh": nnx.tanh}[args.sbtm_activation]
+    model = MLPScoreModel(0, args.dv, hidden_dims=tuple(args.sbtm_hidden_dims),
+                          activation=activation, seed=args.seed, dtype=v.dtype)
     weight_decay = args.sbtm_weight_decay if args.sbtm_optimizer == "adamw" else 0.0
     transform = (optax.adamw(args.sbtm_lr, weight_decay=weight_decay)
                  if args.sbtm_optimizer == "adamw" else optax.adam(args.sbtm_lr))
@@ -290,6 +299,7 @@ def initialize_model(args, v, key, exact_score, *, sample_initial):
     # Use a fresh optimizer for implicit fitting after the supervised t0 fit.
     optimizer = nnx.Optimizer(model, transform, wrt=nnx.Param)
     return model, optimizer, dict(initial_score_mse=loss, initial_simulation_score_mse=simulation_loss,
+                                 initial_activation=args.sbtm_activation,
                                  initial_training_particles=len(training_v),
                                  initial_sample_independent=training_v is not v,
                                  initial_optimizer=args.sbtm_optimizer, initial_weight_decay=weight_decay,

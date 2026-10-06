@@ -9,11 +9,17 @@
 #SBATCH --output=logs/%x_%N_%j.out
 
 # Submit from the repository root: mkdir -p logs && sbatch scripts/homo_BKW.slurm
-# Default: the first-order score-evolution method in Latex/VML equations.tex.
+# Default: score evolution with energy-conserving particle time stepping.
+# The score retains its first-order parameter update from Latex/VML equations.tex.
 # Arguments override sweep defaults, for example:
 #   sbatch scripts/homo_BKW.slurm --sbtm_optimizer adam
 #   sbatch scripts/homo_BKW.slurm --sbtm_n_initial 100000
 #   sbatch scripts/homo_BKW.slurm --time_integrator midpoint
+# Select the score derivative R (kernel is the default):
+#   sbatch scripts/homo_BKW.slurm --score_evolution_rhs kernel
+#   sbatch scripts/homo_BKW.slurm --score_evolution_rhs transport
+# Transport defaults to a smooth tanh network; use --sbtm_activation tanh with
+# kernel too when comparing the two RHS choices using the same activation.
 # Compare methods using a common integrator:
 #   sbatch scripts/homo_BKW.slurm --score_methods sbtm blob score_evolution --time_integrator forward_euler
 set -eo pipefail
@@ -33,7 +39,8 @@ output_dir="data/homo_BKW/sweep_job${SLURM_JOB_ID}_restart${SLURM_RESTART_COUNT:
 # Preserve Slurm's CUDA_VISIBLE_DEVICES; do not override it with --gpu.
 # AdamW fits the initial score on 12,800 independent samples for every n by
 # default; --sbtm_optimizer adam selects Adam without weight decay.
-# Score evolution then uses CG; sbtm evolution-training flags below apply only
+# Score evolution then uses one CG solve per step, with the old network reused
+# at the energy-conserving velocity stages; sbtm training flags below apply only
 # when SBTM is requested through --score_methods.
 srun python3 -u experiments/homo_benchmark.py run \
   --example bkw \
@@ -45,7 +52,8 @@ srun python3 -u experiments/homo_benchmark.py run \
   --t0 5.5 \
   --final_time 9.5 \
   --dt 0.01 \
-  --time_integrator forward_euler \
+  --time_integrator energy_conserving \
+  --score_evolution_rhs kernel \
   --sbtm_hidden_dims 100 100 \
   --sbtm_n_initial 12800 \
   --sbtm_lr 0.0004 \

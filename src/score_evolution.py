@@ -1,9 +1,10 @@
 """Homogeneous score evolution from ``Latex/VML equations.tex``.
 
 The network satisfies the Eulerian equation d_t s = R at fixed velocity.
-Gaussian particles supply R, and a weighted ridge least-squares solve gives
-the parameter velocity. Forward Euler and explicit midpoint advance particles
-and parameters together. The energy-conserving option uses the project's
+Either Gaussian particles or the score transport equation supplies R, and a
+weighted ridge least-squares solve gives the parameter velocity. Forward Euler
+and explicit midpoint advance particles and parameters together. The
+energy-conserving option uses the project's
 three-stage particle update with the old network held fixed, while retaining
 the forward-Euler parameter update. No implicit score matching is performed
 after initialization.
@@ -24,11 +25,15 @@ from src.time_integrators import homogeneous_step
 
 def add_score_evolution_arguments(parser):
     group = parser.add_argument_group("score evolution")
+    group.add_argument("--score_evolution_rhs", choices=("kernel", "transport"), default="kernel",
+                       help="Eulerian score derivative R: Gaussian kernel approximation (default), "
+                            "or transport equation with velocity derivatives of the score network")
     group.add_argument("--score_evolution_regularization", type=float, default=1e-4,
                        help="Positive lambda in sum_p w_p |J xi - R|^2 + lambda |xi|^2")
     group.add_argument("--score_evolution_bandwidth", type=float, nargs="+", default=None,
-                       help="Fixed Gaussian standard deviation(s): one value or dv values; "
-                            "default is diagonal Scott bandwidth from the initial particles")
+                       help="Kernel RHS only: fixed Gaussian standard deviation(s), one or dv values; "
+                            "default is diagonal Scott bandwidth from the initial particles; "
+                            "unused by transport")
     group.add_argument("--score_evolution_cg_tol", type=float, default=1e-6,
                        help="Relative normal-equation residual tolerance for conjugate gradient")
     group.add_argument("--score_evolution_cg_maxiter", type=int, default=200,
@@ -95,6 +100,63 @@ def gaussian_score_rhs(points, centers, accelerations, h, weights=None, block_si
         ), axis=1)
 
     return jax.lax.map(evaluate, blocks).reshape(-1, d)[:m]
+
+
+def make_transport_score_rhs(score_function, B, block_size=128):
+    """Build R = -Ds a - Da.T s - grad(div a) for Maxwell particles.
+
+    ``score_function(theta, velocities)`` returns a batch of score vectors.
+    The returned function takes ``(theta, points, centers, weights)``; weights
+    must be nonnegative with positive sum. Source particles, source scores,
+    and their moments stay fixed during differentiation of a query velocity.
+    Each stage recomputes them from that stage's particles and parameters.
+
+    A centered moment expansion evaluates the Maxwell particle sum exactly,
+    avoiding pairwise derivative arrays. Only the query's d velocity inputs
+    are differentiated, including second derivatives for grad(div a). A smooth
+    score model is recommended. Blocking bounds derivative activation storage.
+    The collision prefactor B is included exactly once here.
+    """
+    @jax.jit
+    def evaluate(theta, points, centers, weights):
+        mass = jnp.sum(weights)
+        probabilities = weights / mass
+        source_scores = score_function(theta, centers)
+        mean_v = jnp.sum(probabilities[:, None] * centers, axis=0)
+        mean_s = jnp.sum(probabilities[:, None] * source_scores, axis=0)
+        u = centers - mean_v
+        q = source_scores - mean_s
+        second = u.T @ (probabilities[:, None] * u)
+        cross = u.T @ (probabilities[:, None] * q)
+        radius_score = jnp.sum(
+            probabilities[:, None] * jnp.sum(u**2, axis=1, keepdims=True) * q, axis=0)
+        mixed = jnp.sum(
+            probabilities[:, None] * u * jnp.sum(u * q, axis=1, keepdims=True), axis=0)
+
+        def score(v):
+            return score_function(theta, v[None, :])[0]
+
+        def acceleration(v):
+            w = v - mean_v
+            r = score(v) - mean_s
+            return -B * mass * (
+                (jnp.dot(w, w) + jnp.trace(second)) * r
+                - w * jnp.dot(w, r) - r @ second - radius_score
+                + 2 * w @ cross - w * jnp.trace(cross) - w @ cross.T + mixed)
+
+        jac_a = jax.jacfwd(acceleration)
+        jac_s = jax.jacfwd(score)
+        grad_div_a = jax.grad(lambda v: jnp.trace(jac_a(v)))
+
+        def rhs(v):
+            return -jac_s(v) @ acceleration(v) - jac_a(v).T @ score(v) - grad_div_a(v)
+
+        m, d = points.shape
+        padding = (-m) % block_size
+        blocks = jnp.pad(points, ((0, padding), (0, 0))).reshape(-1, block_size, d)
+        return jax.lax.map(jax.vmap(rhs), blocks).reshape(-1, d)[:m]
+
+    return evaluate
 
 
 def _conjugate_gradient(operator, rhs, tol, maxiter):
@@ -185,14 +247,16 @@ class ScoreEvolutionStepper:
         self.args = args
         self.model = model
         self.log_fit = log_fit
+        self.rhs_method = args.score_evolution_rhs
         self.weights = jnp.full((len(initial_particles),), 1 / len(initial_particles),
                                 dtype=initial_particles.dtype)
-        supplied_h = args.score_evolution_bandwidth
-        self.bandwidth = (scott_bandwidth(initial_particles) if supplied_h is None
-                          else jnp.broadcast_to(jnp.asarray(supplied_h, dtype=initial_particles.dtype),
-                                                (initial_particles.shape[1],)))
-        # Freeze h for the entire trajectory: differentiating a changing Scott
-        # bandwidth would require additional terms absent from the paper's R.
+        self.bandwidth = None
+        if self.rhs_method == "kernel":
+            # Freeze h: changing it would require additional time derivatives.
+            supplied_h = args.score_evolution_bandwidth
+            self.bandwidth = (scott_bandwidth(initial_particles) if supplied_h is None
+                              else jnp.broadcast_to(jnp.asarray(supplied_h, dtype=initial_particles.dtype),
+                                                    (initial_particles.shape[1],)))
         graphdef, parameters, other_state = nnx.split(model, nnx.Param, ...)
         # NNX Linear's param_dtype can differ from its computation dtype.
         # Solve/update in the particle dtype, including in float64 experiments.
@@ -206,6 +270,8 @@ class ScoreEvolutionStepper:
             return network(jnp.empty((len(v), 0), dtype=v.dtype), v)
 
         self._score = jax.jit(score)
+        self._transport_rhs = (make_transport_score_rhs(score, args.B, args.block_size)
+                               if self.rhs_method == "transport" else None)
         self._solve = make_parameter_velocity_solver(
             score, args.score_evolution_regularization,
             args.score_evolution_cg_tol, args.score_evolution_cg_maxiter)
@@ -227,8 +293,11 @@ class ScoreEvolutionStepper:
 
     def _parameter_velocity(self, theta, v, acceleration, t, step, stage):
         started = time.perf_counter()
-        target = gaussian_score_rhs(v, v, acceleration, self.bandwidth,
-                                    self.weights, self.args.block_size)
+        if self.rhs_method == "transport":
+            target = self._transport_rhs(theta, v, v, self.weights)
+        else:
+            target = gaussian_score_rhs(v, v, acceleration, self.bandwidth,
+                                        self.weights, self.args.block_size)
         velocity, diagnostics = self._solve(theta, v, target, self.weights)
         values = {key: float(value) for key, value in diagnostics.items()
                   if key not in ("iterations", "valid", "converged")}
@@ -250,6 +319,7 @@ class ScoreEvolutionStepper:
         if self.log_fit is not None:
             self.log_fit(dict(step=step + 1, time=t, stage=stage,
                               stage_name="n" if stage == 0 else "midpoint",
+                              score_evolution_rhs=self.rhs_method,
                               optimization_steps=iterations, cg_converged=converged,
                               stop_reason="converged" if converged else "residual_tolerance_not_met",
                               **values, optimization_seconds=time.perf_counter() - started))
@@ -297,8 +367,10 @@ class ScoreEvolutionStepper:
     def summary(self):
         return dict(training_passes=0, linear_solves=self.linear_solves,
                     optimization_method="conjugate_gradient",
+                    score_evolution_rhs=self.rhs_method,
                     total_optimization_steps=self.total_optimization_steps,
                     unconverged_linear_solves=self.unconverged_linear_solves,
                     max_linear_relative_residual=self.max_linear_relative_residual,
                     total_problematic_particle_count=self.total_problematic_particles,
-                    score_evolution_bandwidth=self.bandwidth.tolist())
+                    score_evolution_bandwidth=(self.bandwidth.tolist()
+                                               if self.bandwidth is not None else None))

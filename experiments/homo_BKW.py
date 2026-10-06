@@ -12,8 +12,10 @@ entropy gradient of every method called "blob" in the literature).
 
 The score_evolution mode implements Latex/VML equations.tex: initialize with
 the exact BKW score, then evolve network parameters by weighted ridge least
-squares using an Eulerian Gaussian-particle score derivative. The default
-integrator for direct runs of this mode is forward_euler; midpoint and
+squares using an Eulerian Gaussian-particle score derivative. Select
+--score_evolution_rhs transport to use the score transport equation instead;
+its first and second velocity derivatives use a tanh network by default.
+The default integrator for direct runs of this mode is forward_euler; midpoint and
 energy_conserving are also available. The energy-conserving option keeps the
 Euler parameter update and applies the project's three-stage Gamma-corrected
 particle update with the old network fixed throughout the velocity stages.
@@ -235,6 +237,9 @@ def main(argv=None):
               "reference": "IHW25.pdf, Section 5.2, Example 5.1, pp. 1780-1782"}
     (outdir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     print(f"Output: {outdir}\nDevice: {config['device']}\n{name}", flush=True)
+    if args.score_method == "score_evolution":
+        print(f"Score evolution: rhs={args.score_evolution_rhs}, "
+              f"activation={args.sbtm_activation}", flush=True)
     run = None
     if args.wandb_mode != "disabled":
         import wandb
@@ -272,10 +277,12 @@ def main(argv=None):
 
         if args.score_method == "score_evolution":
             stepper = ScoreEvolutionStepper(args, model, v, log_fit=log_fit)
-            config["score_evolution_bandwidth_resolved"] = stepper.bandwidth.tolist()
+            config["score_evolution_bandwidth_resolved"] = (
+                stepper.bandwidth.tolist() if stepper.bandwidth is not None else None)
             (outdir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
             if run:
-                run.config.update({"score_evolution_bandwidth_resolved": stepper.bandwidth.tolist()})
+                run.config.update({"score_evolution_bandwidth_resolved":
+                                   config["score_evolution_bandwidth_resolved"]})
         else:
             stepper = HomogeneousStepper(args, model, optimizer, log_fit=log_fit,
                                          exact_score=lambda velocity, time: bkw_score(velocity, time, args.B))
