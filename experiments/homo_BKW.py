@@ -13,11 +13,14 @@ entropy gradient of every method called "blob" in the literature).
 The score_evolution mode implements Latex/VML equations.tex: initialize with
 the exact BKW score, then evolve network parameters by weighted ridge least
 squares using an Eulerian Gaussian-particle score derivative. The default
-integrator for this mode is forward_euler; midpoint is also available.
+integrator for direct runs of this mode is forward_euler; midpoint and
+energy_conserving are also available. The energy-conserving option keeps the
+Euler parameter update and applies the project's three-stage Gamma-corrected
+particle update with the old network fixed throughout the velocity stages.
 
 Example:
     python experiments/homo_BKW.py --n 12800 --score_method sbtm
-    python experiments/homo_BKW.py --score_method score_evolution --time_integrator midpoint
+    python experiments/homo_BKW.py --score_method score_evolution --time_integrator energy_conserving
 """
 
 import csv

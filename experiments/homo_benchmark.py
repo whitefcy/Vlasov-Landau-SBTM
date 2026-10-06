@@ -61,7 +61,8 @@ def main(argv=None):
         validated = validate([*extra, "--n", str(args.n_values[0]), "--score_method", method])
         integrators.add(validated.time_integrator)
     if len(integrators) != 1:
-        parser.error("Mixed score_evolution/SBTM/blob sweeps require --time_integrator forward_euler "
+        parser.error("Mixed score_evolution/SBTM/blob sweeps require --time_integrator "
+                     "energy_conserving or forward_euler "
                      "so all runs use the same integrator")
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")

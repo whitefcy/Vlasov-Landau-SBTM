@@ -2,8 +2,10 @@
 
 The network satisfies the Eulerian equation d_t s = R at fixed velocity.
 Gaussian particles supply R, and a weighted ridge least-squares solve gives
-the parameter velocity. Particles and parameters advance together using
-forward Euler or explicit midpoint. No implicit score matching is performed
+the parameter velocity. Forward Euler and explicit midpoint advance particles
+and parameters together. The energy-conserving option uses the project's
+three-stage particle update with the old network held fixed, while retaining
+the forward-Euler parameter update. No implicit score matching is performed
 after initialization.
 """
 
@@ -17,6 +19,7 @@ import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 
 from src.homogeneous import maxwell_collision, scott_bandwidth
+from src.time_integrators import homogeneous_step
 
 
 def add_score_evolution_arguments(parser):
@@ -37,8 +40,8 @@ def validate_score_evolution_args(args, parser):
         args.time_integrator = ("forward_euler" if args.score_method == "score_evolution"
                                 else "energy_conserving")
     if args.score_method == "score_evolution":
-        if args.time_integrator not in ("forward_euler", "midpoint"):
-            parser.error("score_evolution requires --time_integrator forward_euler or midpoint")
+        if args.time_integrator not in ("forward_euler", "midpoint", "energy_conserving"):
+            parser.error("score_evolution requires --time_integrator forward_euler, midpoint, or energy_conserving")
     elif args.time_integrator == "midpoint":
         parser.error("midpoint is currently supported only with --score_method score_evolution")
     for name in ("score_evolution_regularization", "score_evolution_cg_tol",
@@ -166,7 +169,10 @@ class ScoreEvolutionStepper:
     Matches the BKW experiment's start_step/evaluate/advance/summary interface.
     The supplied model must already be fitted to the initial score. Its public
     NNX parameters are updated in-place after each complete step, so off-particle
-    score plots use the evolved network too. Midpoint states are kept private.
+    score plots use the evolved network too. Intermediate states are private.
+    Energy-conserving steps use one score-evolution solve at step start and
+    reevaluate that step's unchanged network at all particle stages. The coupled
+    method remains first order because the parameter update is forward Euler.
     """
 
     def __init__(self, args, model, initial_particles, *, log_fit=None):
@@ -174,8 +180,8 @@ class ScoreEvolutionStepper:
 
         if model is None:
             raise ValueError("Score evolution requires an initialized score network")
-        if args.time_integrator not in ("forward_euler", "midpoint"):
-            raise ValueError("Score evolution supports forward_euler and midpoint")
+        if args.time_integrator not in ("forward_euler", "midpoint", "energy_conserving"):
+            raise ValueError("Score evolution supports forward_euler, midpoint, and energy_conserving")
         self.args = args
         self.model = model
         self.log_fit = log_fit
@@ -208,6 +214,7 @@ class ScoreEvolutionStepper:
         self.linear_solves = 0
         self.unconverged_linear_solves = 0
         self.max_linear_relative_residual = 0.0
+        self.total_problematic_particles = 0
 
     def evaluate(self, v, t):
         """Evaluate the current network without fitting or advancing it."""
@@ -266,13 +273,26 @@ class ScoreEvolutionStepper:
                 theta_half, v_half, acceleration, t + 0.5 * dt, step, 1)
         # Both full updates start at n, including for the midpoint method.
         theta_new = theta_n + dt * parameter_velocity
-        v_new = v + dt * acceleration
+        if self.args.time_integrator == "energy_conserving":
+            # Keep theta_n at every velocity stage. Only the particle time
+            # update changes; the score still uses one Euler/CG update at n.
+            v_new, _, gamma_squared, problematic = homogeneous_step(
+                v, t, dt, self.args.B,
+                lambda velocity, time, stage: self.evaluate(velocity, time),
+                time_integrator="energy_conserving", initial_evaluation=initial)
+            count = int(jnp.sum(problematic))
+            gamma_min = float(jnp.min(gamma_squared))
+        else:
+            v_new = v + dt * acceleration
+            count, gamma_min = 0, 1.0
         if not bool(jnp.all(jnp.isfinite(theta_new))) or not bool(jnp.all(jnp.isfinite(v_new))):
             raise FloatingPointError(f"Nonfinite score-evolution state after t={t}")
         self.theta = theta_new
         nnx.update(self.model, self._unravel(theta_new))
+        self.total_problematic_particles += count
         return v_new, dict(optimization_steps=self.optimization_steps,
-                           gamma_squared_min=1.0, problematic_particle_count=0)
+                           gamma_squared_min=gamma_min if math.isfinite(gamma_min) else None,
+                           problematic_particle_count=count)
 
     def summary(self):
         return dict(training_passes=0, linear_solves=self.linear_solves,
@@ -280,5 +300,5 @@ class ScoreEvolutionStepper:
                     total_optimization_steps=self.total_optimization_steps,
                     unconverged_linear_solves=self.unconverged_linear_solves,
                     max_linear_relative_residual=self.max_linear_relative_residual,
-                    total_problematic_particle_count=0,
+                    total_problematic_particle_count=self.total_problematic_particles,
                     score_evolution_bandwidth=self.bandwidth.tolist())
