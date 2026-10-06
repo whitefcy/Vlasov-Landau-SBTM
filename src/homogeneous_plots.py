@@ -118,7 +118,8 @@ def plot_benchmarks(runs, output_dir):
     groups = defaultdict(list)
     for run in runs:
         groups[(run["config"]["score_method"], run["config"]["n"])].append(run)
-    colors = {"sbtm": "tab:blue", "blob": "tab:orange", "exact": "tab:green"}
+    colors = {"sbtm": "tab:blue", "blob": "tab:orange", "exact": "tab:green",
+              "score_evolution": "tab:purple"}
     fig, axes = plt.subplots(3 if example == "bkw" else 2, 2,
                              figsize=(12, 12 if example == "bkw" else 8), squeeze=False)
     exported = []

@@ -25,7 +25,8 @@ def main(argv=None):
     run = sub.add_parser("run", allow_abbrev=False)
     run.add_argument("--example", choices=["bkw", "anisotropic"], required=True)
     run.add_argument("--n_values", nargs="+", type=int, default=[100, 200, 400, 800, 1600, 3200, 6400, 12800])
-    run.add_argument("--score_methods", nargs="+", choices=["sbtm", "blob", "exact"], default=["sbtm", "blob"])
+    run.add_argument("--score_methods", nargs="+", choices=["sbtm", "blob", "exact", "score_evolution"],
+                     default=["sbtm", "blob"])
     run.add_argument("--seeds", nargs="+", type=int, default=[42])
     run.add_argument("--output_dir", type=Path, default=None)
     plot = sub.add_parser("plot", allow_abbrev=False)
@@ -55,8 +56,13 @@ def main(argv=None):
     else:
         from experiments.homo_anisotropic import parse_args as validate
         script = "homo_anisotropic.py"
+    integrators = set()
     for method in args.score_methods:
-        validate([*extra, "--n", str(args.n_values[0]), "--score_method", method])
+        validated = validate([*extra, "--n", str(args.n_values[0]), "--score_method", method])
+        integrators.add(validated.time_integrator)
+    if len(integrators) != 1:
+        parser.error("Mixed score_evolution/SBTM/blob sweeps require --time_integrator forward_euler "
+                     "so all runs use the same integrator")
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     folder = "homo_BKW" if args.example == "bkw" else "homo_anisotropic"

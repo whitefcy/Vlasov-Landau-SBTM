@@ -27,8 +27,7 @@ import jax.random as jr
 import numpy as np
 
 from src.homogeneous import (
-    gaussian_kde, initialize_model, make_parser, maxwell_collision,
-    scott_bandwidth, validate_args,
+    HomogeneousStepper, initialize_model, make_parser, validate_args,
 )
 
 
@@ -108,7 +107,7 @@ def main(argv=None):
     outdir.mkdir(parents=True, exist_ok=False)
     os.environ.setdefault("MPLCONFIGDIR", str(outdir.resolve() / ".matplotlib"))
     config = {**vars(args), "output_dir": str(outdir), "device": jax.devices()[0].device_kind,
-              "example": "anisotropic", "time_integrator": "forward_euler", "gamma": 0,
+              "example": "anisotropic", "gamma": 0,
               "particle_weight": 1 / args.n, "initial_variances": [1.8, 0.2] + [1.0] * (args.dv - 2),
               "reference": "IHW25.pdf, Example 5.2, Figure 5.3",
               "covariance_normalization": "exp(-4*d*B*t), matching the authors' code and Figure 5.3",
@@ -120,50 +119,44 @@ def main(argv=None):
         import wandb
         run = wandb.init(project=args.wandb_project, name=name, mode=args.wandb_mode, config=config)
 
-    key, sample_key, init_key = jr.split(jr.PRNGKey(args.seed), 3)
+    _, sample_key, init_key = jr.split(jr.PRNGKey(args.seed), 3)
     v = sample_anisotropic(sample_key, args.n, args.dv, dtype)
     initial_mean = jnp.mean(v, axis=0)
     initial_energy = 0.5 * jnp.mean(jnp.sum(v**2, axis=1))
-    x = jnp.empty((args.n, 0), dtype=dtype)
     initialization = {}
+    model = optimizer = None
     if args.score_method == "sbtm":
-        from src.adaptive_score import fit_score
-        model, optimizer, initialization = initialize_model(args, v, init_key, initial_score(v))
+        model, optimizer, initialization = initialize_model(
+            args, v, init_key, initial_score,
+            sample_initial=lambda key, n: sample_anisotropic(key, n, args.dv, dtype))
         (outdir / "initialization.json").write_text(json.dumps(initialization, indent=2) + "\n")
 
     num_steps = math.ceil(max(0, args.final_time / args.dt - 1e-12))
     records, v_traj, t_traj = [], [], []
     started = time.perf_counter()
+    last_step_metrics = dict(optimization_steps=0, gamma_squared_min=1.0, problematic_particle_count=0)
     with (outdir / "metrics.csv").open("w", newline="") as metrics_file, (outdir / "optimization.csv").open("w", newline="") as optimization_file:
         metric_writer = optimization_writer = None
+
+        def log_fit(fit):
+            nonlocal optimization_writer
+            if optimization_writer is None:
+                optimization_writer = csv.DictWriter(optimization_file, fieldnames=fit)
+                optimization_writer.writeheader()
+            optimization_writer.writerow(fit)
+            optimization_file.flush()
+
+        stepper = HomogeneousStepper(args, model, optimizer, log_fit=log_fit)
         for step in range(num_steps + 1):
             t = min(step * args.dt, args.final_time)
-            optimization_steps = 0
-            if args.score_method == "sbtm":
-                if step > 0:
-                    key, train_key = jr.split(key)
-                    fit = fit_score(model, optimizer, x, v, train_key,
-                                    batch_size=args.sbtm_batch_size, max_steps=args.sbtm_num_batch_steps,
-                                    adaptive=args.sbtm_adaptive, min_steps=args.sbtm_min_steps,
-                                    check_every=args.sbtm_check_every, patience=args.sbtm_patience,
-                                    atol=args.sbtm_stop_atol, rtol=args.sbtm_stop_rtol,
-                                    monitor_size=args.sbtm_monitor_size, div_mode=args.sbtm_div_mode)
-                    fit = {"step": step, "time": t, **fit}
-                    if optimization_writer is None:
-                        optimization_writer = csv.DictWriter(optimization_file, fieldnames=fit)
-                        optimization_writer.writeheader()
-                    optimization_writer.writerow(fit)
-                    optimization_file.flush()
-                    optimization_steps = fit["optimization_steps"]
-                s = model(x, v)
-            else:
-                _, s = gaussian_kde(v, v, scott_bandwidth(v), args.block_size)
-            collision = maxwell_collision(v, s)
+            # Train only for actual transport steps; final diagnostics reuse weights.
+            s, collision = (stepper.start_step(v, t, step) if step < num_steps
+                            else stepper.evaluate(v, t))
             snapshot_due = step % args.snapshot_every == 0 or step == num_steps
             if step % args.log_every == 0 or snapshot_due:
                 record = dict(step=step, time=t, elapsed_time=t,
                               **benchmark_metrics(v, s, collision, t, initial_mean, initial_energy, args.B),
-                              optimization_steps=optimization_steps,
+                              **last_step_metrics,
                               wall_seconds=time.perf_counter() - started)
                 if metric_writer is None:
                     metric_writer = csv.DictWriter(metrics_file, fieldnames=record)
@@ -172,7 +165,7 @@ def main(argv=None):
                 metrics_file.flush()
                 records.append(record)
                 if run:
-                    run.log(record, step=step)
+                    run.log({k: value for k, value in record.items() if value is not None}, step=step)
                 if snapshot_due:
                     print(f"t={t:.5g}: covariance Frobenius error={record['second_moment_error_fro']:.4g}, "
                           f"entropy rate={record['estimated_entropy_rate']:.4g}", flush=True)
@@ -181,11 +174,11 @@ def main(argv=None):
                 t_traj.append(t)
             if step < num_steps:
                 next_time = min((step + 1) * args.dt, args.final_time)
-                v = v - (next_time - t) * args.B * collision
+                v, last_step_metrics = stepper.advance(v, t, next_time - t, step, (s, collision))
 
     np.savez_compressed(outdir / "snapshots.npz", t_traj=np.array(t_traj), v_traj=np.stack(v_traj))
     summary = {"initialization": initialization, "initial": records[0], "final": records[-1],
-               "num_steps": num_steps, "simulation_wall_seconds": time.perf_counter() - started}
+               "num_steps": num_steps, "evolution": stepper.summary(), "simulation_wall_seconds": time.perf_counter() - started}
     (outdir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     from src.homogeneous_plots import plot_benchmarks
     plot_benchmarks([dict(config=config, records=records, summary=summary, path=str(outdir))], outdir)
@@ -193,7 +186,7 @@ def main(argv=None):
         import wandb
         run.log({"fig5_3": wandb.Image(str(outdir / "fig5_3.png"))})
         run.finish()
-    print(f"Completed {num_steps} forward Euler steps. Results: {outdir}", flush=True)
+    print(f"Completed {num_steps} {args.time_integrator} steps. Results: {outdir}", flush=True)
     return outdir
 
 

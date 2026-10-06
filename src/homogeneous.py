@@ -66,7 +66,9 @@ def gaussian_kde(points, centers, h, block_size=128):
     return density.reshape(-1)[:m], score.reshape(-1, d)[:m]
 
 
-def make_parser(description, *, score_methods=("sbtm", "blob", "exact")):
+def make_parser(description, *, score_methods=("sbtm", "blob", "exact"),
+                time_integrators=("energy_conserving", "forward_euler"),
+                default_time_integrator="energy_conserving"):
     p = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
     p.add_argument("--n", type=int, default=12800)
     p.add_argument("--dv", type=int, default=3)
@@ -74,8 +76,9 @@ def make_parser(description, *, score_methods=("sbtm", "blob", "exact")):
     p.add_argument("--t0", type=float, default=5.5)
     p.add_argument("--final_time", type=float, default=9.5, help="Physical end time, not duration")
     p.add_argument("--dt", type=float, default=0.01)
-    p.add_argument("--time_integrator", choices=["energy_conserving", "forward_euler"],
-                   default="energy_conserving", help="Project energy-conserving scheme or forward Euler")
+    p.add_argument("--time_integrator", choices=time_integrators,
+                   default=default_time_integrator,
+                   help="Time update; defaults to energy_conserving, or forward_euler for score_evolution")
     p.add_argument("--score_method", choices=score_methods, default="sbtm")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--gpu", default=None, help="Optional CUDA index; otherwise preserve Slurm visibility")
@@ -87,9 +90,14 @@ def make_parser(description, *, score_methods=("sbtm", "blob", "exact")):
     p.add_argument("--output_dir", type=Path, default=None)
     p.add_argument("--sbtm_hidden_dims", type=int, nargs="+", default=[100, 100])
     p.add_argument("--sbtm_batch_size", type=int, default=1024)
+    p.add_argument("--sbtm_n_initial", type=int, default=None,
+                   help="Independent particles used only for supervised initial score fitting; "
+                        "default reuses the n simulation particles")
     p.add_argument("--sbtm_num_epochs", type=int, default=1000, help="Maximum supervised initialization epochs")
     p.add_argument("--sbtm_abs_tol", type=float, default=1e-4)
     p.add_argument("--sbtm_lr", type=float, default=4e-4)
+    p.add_argument("--sbtm_weight_decay", type=float, default=1e-4,
+                   help="AdamW weight decay for initialization and SBTM fitting; independent of score-evolution ridge lambda")
     p.add_argument("--sbtm_num_batch_steps", type=int, default=100,
                    help="Optimizer updates per training pass (maximum when adaptive)")
     p.add_argument("--sbtm_adaptive", action=argparse.BooleanOptionalAction, default=False)
@@ -117,13 +125,15 @@ def validate_args(args, p):
         p.error("Step sizes, counts, B, and learning rate must be finite and positive")
     if args.n < 2 or args.dv < 2 or min(args.sbtm_hidden_dims) < 1:
         p.error("Require n >= 2, dv >= 2, and positive hidden dimensions")
+    if args.sbtm_n_initial is not None and args.sbtm_n_initial < 1:
+        p.error("sbtm_n_initial must be positive")
     if not math.isfinite(args.t0):
         p.error("t0 must be finite")
     if not math.isfinite(args.final_time) or args.final_time < args.t0:
         p.error("final_time must be finite and >= t0 (both are physical times)")
     if args.sbtm_adaptive and args.sbtm_min_steps > args.sbtm_num_batch_steps:
         p.error("sbtm_min_steps must not exceed sbtm_num_batch_steps in adaptive mode")
-    for name in ["sbtm_abs_tol", "sbtm_stop_atol", "sbtm_stop_rtol"]:
+    for name in ["sbtm_abs_tol", "sbtm_stop_atol", "sbtm_stop_rtol", "sbtm_weight_decay"]:
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             p.error(f"{name} must be finite and nonnegative")
     return args
@@ -203,22 +213,45 @@ class HomogeneousStepper:
                     total_problematic_particle_count=self.total_problematic_particles)
 
 
-def initialize_model(args, v, key, target):
+def initialize_model(args, v, key, exact_score, *, sample_initial):
+    """Fit at t0, optionally using an independent sample larger than ``v``.
+
+    ``v`` remains the simulation sample. ``sample_initial(key, n)`` draws from
+    the same initial density, and ``exact_score`` supplies its analytic labels.
+    The extra draw uses only the initialization RNG stream, leaving simulation
+    particles and their weights unchanged across methods and fitting budgets.
+    """
     from flax import nnx
     import optax
     from src.score_model import MLPScoreModel
 
-    # Empty position inputs retain the shared model/loss API with only d inputs.
-    x = jnp.empty((len(v), 0), dtype=v.dtype)
+    training_v = v
+    if args.sbtm_n_initial is not None:
+        key, sample_key = jr.split(key)
+        training_v = sample_initial(sample_key, args.sbtm_n_initial)
+    target = exact_score(training_v)
     model = MLPScoreModel(0, args.dv, hidden_dims=tuple(args.sbtm_hidden_dims), seed=args.seed, dtype=v.dtype)
-    optimizer = nnx.Optimizer(model, optax.adam(args.sbtm_lr), wrt=nnx.Param)
+    transform = optax.adamw(args.sbtm_lr, weight_decay=args.sbtm_weight_decay)
+    optimizer = nnx.Optimizer(model, transform, wrt=nnx.Param)
+
+    def objective(model, vb, sb):
+        pred = model(jnp.empty((len(vb), 0), dtype=vb.dtype), vb)
+        return jnp.mean(jnp.sum((pred - sb)**2, axis=1))
+
+    batch_loss = nnx.jit(objective)
+
+    def score_mse(particles, labels):
+        # Bound network activation memory even for a large initial fit sample.
+        total = jnp.array(0., dtype=v.dtype)
+        for offset in range(0, len(particles), args.sbtm_batch_size):
+            vb = particles[offset:offset + args.sbtm_batch_size]
+            sb = labels[offset:offset + args.sbtm_batch_size]
+            total += len(vb) * batch_loss(model, vb, sb)
+        return float(total / len(particles))
 
     @nnx.jit
     def initial_update(model, optimizer, vb, sb):
-        def objective(model):
-            pred = model(jnp.empty((len(vb), 0), dtype=vb.dtype), vb)
-            return jnp.mean(jnp.sum((pred - sb)**2, axis=1))
-        value, grads = nnx.value_and_grad(objective)(model)
+        value, grads = nnx.value_and_grad(objective)(model, vb, sb)
         if hasattr(optimizer, "model"):
             optimizer.update(grads)
         else:
@@ -226,8 +259,11 @@ def initialize_model(args, v, key, target):
         return value
 
     started = time.perf_counter()
+    epochs_completed = optimization_steps = 0
+    print(f"Initial score fit: {len(training_v)} training particles, {len(v)} simulation particles, "
+          f"AdamW weight_decay={args.sbtm_weight_decay:g}", flush=True)
     for epoch in range(args.sbtm_num_epochs):
-        loss = float(jnp.mean(jnp.sum((model(x, v) - target)**2, axis=1)))
+        loss = score_mse(training_v, target)
         if not math.isfinite(loss):
             raise FloatingPointError("Nonfinite initial score loss")
         if epoch % 100 == 0:
@@ -235,15 +271,23 @@ def initialize_model(args, v, key, target):
         if loss <= args.sbtm_abs_tol:
             break
         key, batch_key = jr.split(key)
-        order = jr.permutation(batch_key, len(v))
-        for offset in range(0, len(v), args.sbtm_batch_size):
+        order = jr.permutation(batch_key, len(training_v))
+        for offset in range(0, len(training_v), args.sbtm_batch_size):
             ids = order[offset:offset + args.sbtm_batch_size]
-            initial_update(model, optimizer, v[ids], target[ids])
-    loss = float(jnp.mean(jnp.sum((model(x, v) - target)**2, axis=1)))
-    if not math.isfinite(loss):
+            initial_update(model, optimizer, training_v[ids], target[ids])
+            optimization_steps += 1
+        epochs_completed += 1
+    loss = score_mse(training_v, target)
+    simulation_loss = loss if training_v is v else score_mse(v, exact_score(v))
+    if not math.isfinite(loss) or not math.isfinite(simulation_loss):
         raise FloatingPointError("Nonfinite final initialization loss")
     print(f"Initial score fit finished: MSE={loss:.6g}, tolerance_met={loss <= args.sbtm_abs_tol}", flush=True)
     # Use a fresh optimizer for implicit fitting after the supervised t0 fit.
-    optimizer = nnx.Optimizer(model, optax.adam(args.sbtm_lr), wrt=nnx.Param)
-    return model, optimizer, dict(initial_score_mse=loss, initial_fit_seconds=time.perf_counter() - started,
+    optimizer = nnx.Optimizer(model, transform, wrt=nnx.Param)
+    return model, optimizer, dict(initial_score_mse=loss, initial_simulation_score_mse=simulation_loss,
+                                 initial_training_particles=len(training_v),
+                                 initial_sample_independent=training_v is not v,
+                                 initial_optimizer="adamw", initial_weight_decay=args.sbtm_weight_decay,
+                                 initial_epochs=epochs_completed, initial_optimization_steps=optimization_steps,
+                                 initial_fit_seconds=time.perf_counter() - started,
                                  initial_tolerance_met=loss <= args.sbtm_abs_tol)

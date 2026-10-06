@@ -10,8 +10,14 @@ differs from the paper's fixed 25 denoising updates with alpha=0.4. The blob
 mode uses the repository's Gaussian-KDE score convention (not the variational
 entropy gradient of every method called "blob" in the literature).
 
+The score_evolution mode implements Latex/VML equations.tex: initialize with
+the exact BKW score, then evolve network parameters by weighted ridge least
+squares using an Eulerian Gaussian-particle score derivative. The default
+integrator for this mode is forward_euler; midpoint is also available.
+
 Example:
     python experiments/homo_BKW.py --n 12800 --score_method sbtm
+    python experiments/homo_BKW.py --score_method score_evolution --time_integrator midpoint
 """
 
 import csv
@@ -33,6 +39,9 @@ import numpy as np
 from src.homogeneous import (
     HomogeneousStepper, gaussian_kde, initialize_model, make_parser, maxwell_collision,
     scott_bandwidth, validate_args,
+)
+from src.score_evolution import (
+    ScoreEvolutionStepper, add_score_evolution_arguments, validate_score_evolution_args,
 )
 
 
@@ -108,8 +117,11 @@ def density_l2_error(v, t, B=1 / 24, block_size=128):
 
 
 def parse_args(argv=None):
-    p = make_parser(__doc__)
-    args = validate_args(p.parse_args(argv), p)
+    p = make_parser(__doc__, score_methods=("sbtm", "blob", "exact", "score_evolution"),
+                    time_integrators=("energy_conserving", "forward_euler", "midpoint"),
+                    default_time_integrator=None)
+    add_score_evolution_arguments(p)
+    args = validate_args(validate_score_evolution_args(p.parse_args(argv), p), p)
     threshold = math.log(args.dv / 2 + 1) / (2 * args.B * (args.dv - 1))
     if args.t0 <= threshold:
         p.error(f"t0 must exceed {threshold:.12g} for a positive, nonsingular BKW density")
@@ -231,8 +243,10 @@ def main(argv=None):
     initial_energy = 0.5 * jnp.mean(jnp.sum(v**2, axis=1))
     initialization = {}
     model = optimizer = None
-    if args.score_method == "sbtm":
-        model, optimizer, initialization = initialize_model(args, v, init_key, bkw_score(v, args.t0, args.B))
+    if args.score_method in ("sbtm", "score_evolution"):
+        model, optimizer, initialization = initialize_model(
+            args, v, init_key, lambda velocity: bkw_score(velocity, args.t0, args.B),
+            sample_initial=lambda key, n: sample_bkw(key, n, args.t0, args.dv, args.B, dtype))
         (outdir / "initialization.json").write_text(json.dumps(initialization, indent=2) + "\n")
 
     duration = args.final_time - args.t0
@@ -253,8 +267,15 @@ def main(argv=None):
             optimization_writer.writerow(fit)
             optimization_file.flush()
 
-        stepper = HomogeneousStepper(args, model, optimizer, log_fit=log_fit,
-                                     exact_score=lambda velocity, time: bkw_score(velocity, time, args.B))
+        if args.score_method == "score_evolution":
+            stepper = ScoreEvolutionStepper(args, model, v, log_fit=log_fit)
+            config["score_evolution_bandwidth_resolved"] = stepper.bandwidth.tolist()
+            (outdir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+            if run:
+                run.config.update({"score_evolution_bandwidth_resolved": stepper.bandwidth.tolist()})
+        else:
+            stepper = HomogeneousStepper(args, model, optimizer, log_fit=log_fit,
+                                         exact_score=lambda velocity, time: bkw_score(velocity, time, args.B))
         for step in range(num_steps + 1):
             t = min(args.t0 + step * args.dt, args.final_time)
             # Train only for actual transport steps; final diagnostics reuse weights.
@@ -289,7 +310,7 @@ def main(argv=None):
             if snapshot_due:
                 density_estimated, score_kde = gaussian_kde(points, v, scott_bandwidth(v), args.block_size)
                 score_exact = bkw_score(points, t, args.B)
-                if args.score_method == "sbtm":
+                if args.score_method in ("sbtm", "score_evolution"):
                     score_estimated = model(jnp.empty((len(points), 0), dtype=dtype), points)
                 else:
                     score_estimated = score_kde if args.score_method == "blob" else score_exact

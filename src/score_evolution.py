@@ -1,0 +1,284 @@
+"""Homogeneous score evolution from ``Latex/VML equations.tex``.
+
+The network satisfies the Eulerian equation d_t s = R at fixed velocity.
+Gaussian particles supply R, and a weighted ridge least-squares solve gives
+the parameter velocity. Particles and parameters advance together using
+forward Euler or explicit midpoint. No implicit score matching is performed
+after initialization.
+"""
+
+from functools import partial
+import math
+import time
+import warnings
+
+import jax
+import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
+
+from src.homogeneous import maxwell_collision, scott_bandwidth
+
+
+def add_score_evolution_arguments(parser):
+    group = parser.add_argument_group("score evolution")
+    group.add_argument("--score_evolution_regularization", type=float, default=1e-4,
+                       help="Positive lambda in sum_p w_p |J xi - R|^2 + lambda |xi|^2")
+    group.add_argument("--score_evolution_bandwidth", type=float, nargs="+", default=None,
+                       help="Fixed Gaussian standard deviation(s): one value or dv values; "
+                            "default is diagonal Scott bandwidth from the initial particles")
+    group.add_argument("--score_evolution_cg_tol", type=float, default=1e-6,
+                       help="Relative normal-equation residual tolerance for conjugate gradient")
+    group.add_argument("--score_evolution_cg_maxiter", type=int, default=200,
+                       help="Maximum conjugate-gradient iterations per stage")
+
+
+def validate_score_evolution_args(args, parser):
+    if args.time_integrator is None:
+        args.time_integrator = ("forward_euler" if args.score_method == "score_evolution"
+                                else "energy_conserving")
+    if args.score_method == "score_evolution":
+        if args.time_integrator not in ("forward_euler", "midpoint"):
+            parser.error("score_evolution requires --time_integrator forward_euler or midpoint")
+    elif args.time_integrator == "midpoint":
+        parser.error("midpoint is currently supported only with --score_method score_evolution")
+    for name in ("score_evolution_regularization", "score_evolution_cg_tol",
+                 "score_evolution_cg_maxiter"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0:
+            parser.error(f"{name} must be finite and positive")
+    if args.score_evolution_cg_tol >= 1:
+        parser.error("score_evolution_cg_tol must be less than 1")
+    h = args.score_evolution_bandwidth
+    if h is not None and (len(h) not in (1, args.dv)
+                          or any(not math.isfinite(value) or value <= 0 for value in h)):
+        parser.error("score_evolution_bandwidth requires one or dv finite positive standard deviations")
+    return args
+
+
+@partial(jax.jit, static_argnames=("block_size",))
+def gaussian_score_rhs(points, centers, accelerations, h, weights=None, block_size=128):
+    """Evaluate R = d_t grad(log f_h) at *fixed* query points and bandwidth.
+
+    ``h`` contains Gaussian standard deviations (covariance diag(h**2)).
+    The centers move with the supplied accelerations; weights stay constant.
+    Including self terms agrees with the paper's particle reconstruction.
+    We evaluate f_t/f and grad(f)_t/f using normalized kernel weights, avoiding
+    division by a possibly underflowed density. No material/convective term
+    involving the motion of a query point is added.
+
+    Work is O(m*n*d), with O(block_size*n*d) pairwise storage. ``weights``
+    defaults to 1/n; supplied weights must be nonnegative with positive sum.
+    """
+    m, d = points.shape
+    n = centers.shape[0]
+    if weights is None:
+        weights = jnp.full((n,), 1 / n, dtype=centers.dtype)
+    log_weights = jnp.log(weights)
+    padding = (-m) % block_size
+    blocks = jnp.pad(points, ((0, padding), (0, 0))).reshape(-1, block_size, d)
+
+    def evaluate(block):
+        delta = centers[None, :, :] - block[:, None, :]
+        grad_log_kernel = delta / h**2
+        exponent = -0.5 * jnp.sum((delta / h)**2, axis=-1) + log_weights
+        shifted = jnp.exp(exponent - jnp.max(exponent, axis=1, keepdims=True))
+        probabilities = shifted / jnp.sum(shifted, axis=1, keepdims=True)
+        score = jnp.sum(probabilities[:, :, None] * grad_log_kernel, axis=1)
+        # K_t/K = -a_q . grad(log K); (grad K)_t/K = a_q/h^2 + grad(log K)*K_t/K.
+        kernel_time_ratio = -jnp.sum(grad_log_kernel * accelerations[None, :, :], axis=-1)
+        return jnp.sum(probabilities[:, :, None] * (
+            accelerations[None, :, :] / h**2
+            + (grad_log_kernel - score[:, None, :]) * kernel_time_ratio[:, :, None]
+        ), axis=1)
+
+    return jax.lax.map(evaluate, blocks).reshape(-1, d)[:m]
+
+
+def _conjugate_gradient(operator, rhs, tol, maxiter):
+    """Zero-start CG for a positive-definite operator, including iteration count."""
+    rhs_squared = jnp.vdot(rhs, rhs).real
+    threshold = tol**2 * rhs_squared
+    initial = (jnp.array(0), jnp.zeros_like(rhs), rhs, rhs, rhs_squared, jnp.array(True))
+
+    def condition(state):
+        count, _, _, _, residual_squared, valid = state
+        return (count < maxiter) & (residual_squared > threshold) & valid
+
+    def iteration(state):
+        count, solution, residual, direction, residual_squared, _ = state
+        product = operator(direction)
+        curvature = jnp.vdot(direction, product).real
+        valid = jnp.isfinite(curvature) & (curvature > 0)
+        alpha = residual_squared / jnp.where(valid, curvature, 1.0)
+        solution = solution + alpha * direction
+        residual = residual - alpha * product
+        updated_squared = jnp.vdot(residual, residual).real
+        beta = updated_squared / residual_squared
+        direction = residual + beta * direction
+        return (count + 1, solution, residual, direction, updated_squared,
+                valid & jnp.isfinite(updated_squared))
+
+    count, solution, _, _, _, valid = jax.lax.while_loop(condition, iteration, initial)
+    return solution, count, valid
+
+
+def make_parameter_velocity_solver(score_function, regularization, tol, maxiter):
+    """Build a matrix-free solve of (J.T W J + lambda I) xi = J.T W R.
+
+    ``score_function(theta, v)`` returns an (n, d) score array. JAX's linearized
+    forward map and its transpose provide JVPs/VJPs without storing either J
+    or the parameter-by-parameter normal matrix. The particle weights multiply
+    the squared vector residual; there is no extra division by d or n.
+    """
+    @jax.jit
+    def solve(theta, v, target, weights):
+        _, push = jax.linearize(lambda parameters: score_function(parameters, v), theta)
+        pull = jax.linear_transpose(push, jnp.zeros_like(theta))
+
+        def normal(vector):
+            return pull(weights[:, None] * push(vector))[0] + regularization * vector
+
+        rhs = pull(weights[:, None] * target)[0]
+        velocity, iterations, valid = _conjugate_gradient(normal, rhs, tol, maxiter)
+        residual = push(velocity) - target
+        fit_residual_squared = jnp.sum(weights[:, None] * residual**2)
+        rhs_norm = jnp.linalg.norm(rhs)
+        # Measure the true residual as well as CG's recursive stopping criterion.
+        linear_residual = jnp.linalg.norm(normal(velocity) - rhs)
+        relative_residual = linear_residual / jnp.maximum(rhs_norm, jnp.finfo(rhs.dtype).tiny)
+        velocity_squared = jnp.vdot(velocity, velocity).real
+        return velocity, dict(
+            iterations=iterations, valid=valid,
+            converged=valid & (linear_residual <= tol * rhs_norm),
+            initial_loss=jnp.sum(weights[:, None] * target**2),
+            final_loss=fit_residual_squared + regularization * velocity_squared,
+            fit_residual_squared=fit_residual_squared,
+            linear_residual=linear_residual, linear_relative_residual=relative_residual,
+            parameter_velocity_norm=jnp.sqrt(velocity_squared),
+        )
+
+    return solve
+
+
+class ScoreEvolutionStepper:
+    """Coupled equal-weight Maxwell particles and network parameter evolution.
+
+    Matches the BKW experiment's start_step/evaluate/advance/summary interface.
+    The supplied model must already be fitted to the initial score. Its public
+    NNX parameters are updated in-place after each complete step, so off-particle
+    score plots use the evolved network too. Midpoint states are kept private.
+    """
+
+    def __init__(self, args, model, initial_particles, *, log_fit=None):
+        from flax import nnx
+
+        if model is None:
+            raise ValueError("Score evolution requires an initialized score network")
+        if args.time_integrator not in ("forward_euler", "midpoint"):
+            raise ValueError("Score evolution supports forward_euler and midpoint")
+        self.args = args
+        self.model = model
+        self.log_fit = log_fit
+        self.weights = jnp.full((len(initial_particles),), 1 / len(initial_particles),
+                                dtype=initial_particles.dtype)
+        supplied_h = args.score_evolution_bandwidth
+        self.bandwidth = (scott_bandwidth(initial_particles) if supplied_h is None
+                          else jnp.broadcast_to(jnp.asarray(supplied_h, dtype=initial_particles.dtype),
+                                                (initial_particles.shape[1],)))
+        # Freeze h for the entire trajectory: differentiating a changing Scott
+        # bandwidth would require additional terms absent from the paper's R.
+        graphdef, parameters, other_state = nnx.split(model, nnx.Param, ...)
+        # NNX Linear's param_dtype can differ from its computation dtype.
+        # Solve/update in the particle dtype, including in float64 experiments.
+        parameters = jax.tree_util.tree_map(lambda value: value.astype(initial_particles.dtype), parameters)
+        self.theta, self._unravel = ravel_pytree(parameters)
+        nnx.update(model, parameters)
+        unravel = self._unravel
+
+        def score(parameters, v):
+            network = nnx.merge(graphdef, unravel(parameters), other_state)
+            return network(jnp.empty((len(v), 0), dtype=v.dtype), v)
+
+        self._score = jax.jit(score)
+        self._solve = make_parameter_velocity_solver(
+            score, args.score_evolution_regularization,
+            args.score_evolution_cg_tol, args.score_evolution_cg_maxiter)
+        self.optimization_steps = 0
+        self.total_optimization_steps = 0
+        self.linear_solves = 0
+        self.unconverged_linear_solves = 0
+        self.max_linear_relative_residual = 0.0
+
+    def evaluate(self, v, t):
+        """Evaluate the current network without fitting or advancing it."""
+        score = self._score(self.theta, v)
+        return score, maxwell_collision(v, score)
+
+    def start_step(self, v, t, step):
+        self.optimization_steps = 0
+        return self.evaluate(v, t)
+
+    def _parameter_velocity(self, theta, v, acceleration, t, step, stage):
+        started = time.perf_counter()
+        target = gaussian_score_rhs(v, v, acceleration, self.bandwidth,
+                                    self.weights, self.args.block_size)
+        velocity, diagnostics = self._solve(theta, v, target, self.weights)
+        values = {key: float(value) for key, value in diagnostics.items()
+                  if key not in ("iterations", "valid", "converged")}
+        if (not bool(diagnostics["valid"]) or not all(map(math.isfinite, values.values()))
+                or not bool(jnp.all(jnp.isfinite(velocity)))):
+            raise FloatingPointError(f"Invalid score-evolution solve at t={t}, stage={stage}")
+        iterations = int(diagnostics["iterations"])
+        converged = bool(diagnostics["converged"])
+        self.optimization_steps += iterations
+        self.total_optimization_steps += iterations
+        self.linear_solves += 1
+        self.unconverged_linear_solves += int(not converged)
+        self.max_linear_relative_residual = max(self.max_linear_relative_residual,
+                                                values["linear_relative_residual"])
+        if not converged:
+            warnings.warn("Score-evolution CG missed its residual tolerance; inspect optimization.csv "
+                          "and consider increasing --score_evolution_cg_maxiter or regularization.",
+                          RuntimeWarning, stacklevel=2)
+        if self.log_fit is not None:
+            self.log_fit(dict(step=step + 1, time=t, stage=stage,
+                              stage_name="n" if stage == 0 else "midpoint",
+                              optimization_steps=iterations, cg_converged=converged,
+                              stop_reason="converged" if converged else "residual_tolerance_not_met",
+                              **values, optimization_seconds=time.perf_counter() - started))
+        return velocity
+
+    def advance(self, v, t, dt, step, initial_evaluation=None):
+        from flax import nnx
+
+        self.optimization_steps = 0
+        initial = self.evaluate(v, t) if initial_evaluation is None else initial_evaluation
+        # maxwell_collision excludes B; apply the prefactor exactly once.
+        acceleration = -self.args.B * initial[1]
+        theta_n = self.theta
+        parameter_velocity = self._parameter_velocity(theta_n, v, acceleration, t, step, 0)
+        if self.args.time_integrator == "midpoint":
+            theta_half = theta_n + (0.5 * dt) * parameter_velocity
+            v_half = v + (0.5 * dt) * acceleration
+            score_half = self._score(theta_half, v_half)
+            acceleration = -self.args.B * maxwell_collision(v_half, score_half)
+            parameter_velocity = self._parameter_velocity(
+                theta_half, v_half, acceleration, t + 0.5 * dt, step, 1)
+        # Both full updates start at n, including for the midpoint method.
+        theta_new = theta_n + dt * parameter_velocity
+        v_new = v + dt * acceleration
+        if not bool(jnp.all(jnp.isfinite(theta_new))) or not bool(jnp.all(jnp.isfinite(v_new))):
+            raise FloatingPointError(f"Nonfinite score-evolution state after t={t}")
+        self.theta = theta_new
+        nnx.update(self.model, self._unravel(theta_new))
+        return v_new, dict(optimization_steps=self.optimization_steps,
+                           gamma_squared_min=1.0, problematic_particle_count=0)
+
+    def summary(self):
+        return dict(training_passes=0, linear_solves=self.linear_solves,
+                    optimization_method="conjugate_gradient",
+                    total_optimization_steps=self.total_optimization_steps,
+                    unconverged_linear_solves=self.unconverged_linear_solves,
+                    max_linear_relative_residual=self.max_linear_relative_residual,
+                    total_problematic_particle_count=0,
+                    score_evolution_bandwidth=self.bandwidth.tolist())
