@@ -11,6 +11,7 @@
 # Submit from the repository root: mkdir -p logs && sbatch scripts/homo_BKW.slurm
 # Default: the first-order score-evolution method in Latex/VML equations.tex.
 # Arguments override sweep defaults, for example:
+#   sbatch scripts/homo_BKW.slurm --sbtm_optimizer adam
 #   sbatch scripts/homo_BKW.slurm --sbtm_n_initial 100000
 #   sbatch scripts/homo_BKW.slurm --time_integrator midpoint
 # Compare methods using a common integrator:
@@ -30,7 +31,8 @@ SEEDS=(42) # Add independent seeds to average curves and final errors.
 output_dir="data/homo_BKW/sweep_job${SLURM_JOB_ID}_restart${SLURM_RESTART_COUNT:-0}"
 
 # Preserve Slurm's CUDA_VISIBLE_DEVICES; do not override it with --gpu.
-# AdamW fits the initial score on 12,800 independent samples for every n.
+# AdamW fits the initial score on 12,800 independent samples for every n by
+# default; --sbtm_optimizer adam selects Adam without weight decay.
 # Score evolution then uses CG; sbtm evolution-training flags below apply only
 # when SBTM is requested through --score_methods.
 srun python3 -u experiments/homo_benchmark.py run \
@@ -47,6 +49,7 @@ srun python3 -u experiments/homo_benchmark.py run \
   --sbtm_hidden_dims 100 100 \
   --sbtm_n_initial 12800 \
   --sbtm_lr 0.0004 \
+  --sbtm_optimizer adamw \
   --sbtm_weight_decay 0.0001 \
   --no-sbtm_adaptive \
   --sbtm_training_stages stage0_only \

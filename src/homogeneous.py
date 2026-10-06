@@ -96,8 +96,11 @@ def make_parser(description, *, score_methods=("sbtm", "blob", "exact"),
     p.add_argument("--sbtm_num_epochs", type=int, default=1000, help="Maximum supervised initialization epochs")
     p.add_argument("--sbtm_abs_tol", type=float, default=1e-4)
     p.add_argument("--sbtm_lr", type=float, default=4e-4)
+    p.add_argument("--sbtm_optimizer", type=str.lower, choices=("adam", "adamw"), default="adamw",
+                   help="Optimizer for supervised initialization and SBTM fitting; "
+                        "score evolution still uses CG after initialization")
     p.add_argument("--sbtm_weight_decay", type=float, default=1e-4,
-                   help="AdamW weight decay for initialization and SBTM fitting; independent of score-evolution ridge lambda")
+                   help="Weight decay for AdamW; ignored for Adam and independent of score-evolution ridge lambda")
     p.add_argument("--sbtm_num_batch_steps", type=int, default=100,
                    help="Optimizer updates per training pass (maximum when adaptive)")
     p.add_argument("--sbtm_adaptive", action=argparse.BooleanOptionalAction, default=False)
@@ -231,7 +234,9 @@ def initialize_model(args, v, key, exact_score, *, sample_initial):
         training_v = sample_initial(sample_key, args.sbtm_n_initial)
     target = exact_score(training_v)
     model = MLPScoreModel(0, args.dv, hidden_dims=tuple(args.sbtm_hidden_dims), seed=args.seed, dtype=v.dtype)
-    transform = optax.adamw(args.sbtm_lr, weight_decay=args.sbtm_weight_decay)
+    weight_decay = args.sbtm_weight_decay if args.sbtm_optimizer == "adamw" else 0.0
+    transform = (optax.adamw(args.sbtm_lr, weight_decay=weight_decay)
+                 if args.sbtm_optimizer == "adamw" else optax.adam(args.sbtm_lr))
     optimizer = nnx.Optimizer(model, transform, wrt=nnx.Param)
 
     def objective(model, vb, sb):
@@ -261,7 +266,7 @@ def initialize_model(args, v, key, exact_score, *, sample_initial):
     started = time.perf_counter()
     epochs_completed = optimization_steps = 0
     print(f"Initial score fit: {len(training_v)} training particles, {len(v)} simulation particles, "
-          f"AdamW weight_decay={args.sbtm_weight_decay:g}", flush=True)
+          f"optimizer={args.sbtm_optimizer}, weight_decay={weight_decay:g}", flush=True)
     for epoch in range(args.sbtm_num_epochs):
         loss = score_mse(training_v, target)
         if not math.isfinite(loss):
@@ -287,7 +292,7 @@ def initialize_model(args, v, key, exact_score, *, sample_initial):
     return model, optimizer, dict(initial_score_mse=loss, initial_simulation_score_mse=simulation_loss,
                                  initial_training_particles=len(training_v),
                                  initial_sample_independent=training_v is not v,
-                                 initial_optimizer="adamw", initial_weight_decay=args.sbtm_weight_decay,
+                                 initial_optimizer=args.sbtm_optimizer, initial_weight_decay=weight_decay,
                                  initial_epochs=epochs_completed, initial_optimization_steps=optimization_steps,
                                  initial_fit_seconds=time.perf_counter() - started,
                                  initial_tolerance_met=loss <= args.sbtm_abs_tol)
