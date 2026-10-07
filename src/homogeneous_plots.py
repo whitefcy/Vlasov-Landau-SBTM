@@ -10,6 +10,7 @@ import csv
 import json
 import math
 from pathlib import Path
+import warnings
 
 import numpy as np
 
@@ -18,7 +19,20 @@ def load_runs(paths):
     runs = []
     found = set()
     for path in map(Path, paths):
-        configs = [path / "config.json"] if (path / "config.json").is_file() else sorted(path.rglob("config.json"))
+        if (path / "config.json").is_file():
+            configs = [path / "config.json"]
+        elif (path / "sweep_summary.json").is_file():
+            summary = json.loads((path / "sweep_summary.json").read_text())
+            completed = [record for record in summary["runs"] if record["status"] == "completed"]
+            skipped = len(summary["runs"]) - len(completed)
+            if skipped:
+                warnings.warn(f"Skipping {skipped} unsuccessful sweep run(s) under {path}; "
+                              "see sweep_summary.json for their statuses.", stacklevel=2)
+            if not completed:
+                raise ValueError(f"No completed runs under {path}; see sweep_summary.json")
+            configs = [path / record["directory"] / "config.json" for record in completed]
+        else:
+            configs = sorted(path.rglob("config.json"))
         if not configs:
             raise ValueError(f"No runs found under {path}")
         for config_path in configs:
@@ -26,7 +40,8 @@ def load_runs(paths):
             if root in found:
                 continue
             found.add(root)
-            # Incomplete runs are errors, not silently omitted from a sweep.
+            # Explicit runs and manifest entries marked completed must contain
+            # complete output; only recorded unsuccessful sweep runs are skipped.
             if not (root / "summary.json").is_file():
                 raise ValueError(f"Incomplete run: {root} (summary.json missing)")
             config = json.loads(config_path.read_text())
@@ -52,6 +67,9 @@ def validate_runs(runs):
     identities = set()
     training_config = None
     for run in runs:
+        if run["summary"].get("status", "completed") != "completed":
+            raise ValueError(f"Incomplete run: {run['path']} (status={run['summary']['status']}); "
+                             "use plot --partial for individual BKW diagnostics")
         config = run["config"]
         if any(config.get(key) != first.get(key) for key in common):
             raise ValueError(f"Incompatible physics/time settings in {run['path']}; plot each configuration separately")

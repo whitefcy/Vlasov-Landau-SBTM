@@ -5,6 +5,8 @@ python experiments/homo_benchmark.py plot --input_dirs data/my_sweep --output_di
 
 Unrecognized options after 'run' are validated by and forwarded to each
 experiment, e.g. --dv 10, --dt 0.005, or --sbtm_num_epochs 2000.
+Failed experiment processes are recorded in sweep_summary.json and skipped;
+the remaining runs continue, and combined figures use successful runs only.
 """
 
 import argparse
@@ -32,11 +34,21 @@ def main(argv=None):
     plot = sub.add_parser("plot", allow_abbrev=False)
     plot.add_argument("--input_dirs", type=Path, nargs="+", required=True)
     plot.add_argument("--output_dir", type=Path, required=True)
+    plot.add_argument("--partial", action="store_true",
+                      help="Recover time-series plots from one BKW run, including failed runs; "
+                           "does not produce final-time convergence comparisons")
     args, extra = parser.parse_known_args(argv)
     if args.action == "plot":
         if extra:
             parser.error(f"Unrecognized plot options: {extra}")
         os.environ.setdefault("MPLCONFIGDIR", str(args.output_dir.resolve() / ".matplotlib"))
+        if args.partial:
+            if len(args.input_dirs) != 1:
+                parser.error("--partial requires one BKW run directory")
+            from experiments.homo_BKW import plot_partial_run
+            result = plot_partial_run(args.input_dirs[0], args.output_dir)
+            print(f"Partial diagnostics: {result}", flush=True)
+            return result
         from src.homogeneous_plots import load_runs, plot_benchmarks
         result = plot_benchmarks(load_runs(args.input_dirs), args.output_dir)
         print(f"Figure: {result}", flush=True)
@@ -73,7 +85,19 @@ def main(argv=None):
     specification = dict(example=args.example, n_values=args.n_values, score_methods=args.score_methods,
                          seeds=args.seeds, experiment_arguments=extra)
     (outdir / "sweep.json").write_text(json.dumps(specification, indent=2) + "\n")
-    paths = []
+    paths, outcomes = [], []
+
+    def save_sweep_summary(status):
+        summary = dict(status=status,
+                       planned_runs=len(args.n_values) * len(args.score_methods) * len(args.seeds),
+                       completed_runs=len(paths),
+                       failed_runs=sum(record["status"] == "failed" for record in outcomes),
+                       runs=outcomes)
+        temporary = outdir / ".sweep_summary.tmp.json"
+        temporary.write_text(json.dumps(summary, indent=2) + "\n")
+        temporary.replace(outdir / "sweep_summary.json")
+
+    save_sweep_summary("running")
     for n in args.n_values:
         for method in args.score_methods:
             for seed in args.seeds:
@@ -84,11 +108,30 @@ def main(argv=None):
                            "--output_dir", str(root), "--wandb_run_name", name]
                 print(f"Running {name}", flush=True)
                 # Separate processes release JAX compilation/device memory between runs.
-                subprocess.run(command, check=True)
-                paths.append(root)
+                record = dict(name=name, directory=name, n=n, score_method=method, seed=seed)
+                try:
+                    subprocess.run(command, check=True)
+                except subprocess.CalledProcessError as error:
+                    record.update(status="failed", returncode=error.returncode, command=command)
+                    print(f"FAILED {name} (exit code {error.returncode}). "
+                          f"Partial output: {root}. Continuing with the remaining runs.",
+                          file=sys.stderr, flush=True)
+                else:
+                    record.update(status="completed", returncode=0)
+                    paths.append(root)
+                outcomes.append(record)
+                save_sweep_summary("running")
+
+    failed = len(outcomes) - len(paths)
+    save_sweep_summary("failed" if not paths else "completed_with_failures" if failed else "completed")
+    print(f"Sweep finished: {len(paths)} completed, {failed} failed. "
+          f"Run statuses: {outdir / 'sweep_summary.json'}", flush=True)
+    if not paths:
+        print("No successful runs; skipping combined figures.", file=sys.stderr, flush=True)
+        raise SystemExit(1)
     from src.homogeneous_plots import load_runs, plot_benchmarks
     result = plot_benchmarks(load_runs(paths), outdir)
-    print(f"Sweep complete. Combined figure: {result}", flush=True)
+    print(f"Combined figure from successful runs: {result}", flush=True)
     return result
 
 
