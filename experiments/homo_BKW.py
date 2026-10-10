@@ -164,12 +164,30 @@ def benchmark_metrics(v, s, collision, t, initial_mean, initial_energy, B):
         for j in range(d):
             values[f"second_moment_{i + 1}{j + 1}"] = second[i, j]
     result = {name: float(value) for name, value in values.items()}
-    if not all(math.isfinite(value) for value in result.values()):
-        raise FloatingPointError(f"Nonfinite diagnostic at t={t}")
+    nonfinite = [name for name, value in result.items() if not math.isfinite(value)]
+    if nonfinite:
+        raise FloatingPointError(f"Nonfinite diagnostic at t={t}: {', '.join(nonfinite)}")
     return result
 
 
-def save_plots(outdir, records, snapshots, grid):
+def save_snapshots(outdir, snapshots, grid):
+    """Replace the snapshot archive only after the new archive is written."""
+    if not snapshots:
+        return
+    arrays = dict(t_traj=np.array([s["time"] for s in snapshots]),
+                  v_traj=np.stack([s["v"] for s in snapshots]), slice_grid=grid)
+    arrays.update({name: np.stack([s[name] for s in snapshots]) for name in
+                   ("density_estimated", "density_exact", "score_estimated", "score_exact")})
+    if "theta" in snapshots[0]:
+        arrays["theta_traj"] = np.stack([s["theta"] for s in snapshots])
+    temporary = outdir / ".snapshots.tmp.npz"
+    np.savez_compressed(temporary, **arrays)
+    temporary.replace(outdir / "snapshots.npz")
+
+
+def save_plots(outdir, records, snapshots, grid, *, status_note=None):
+    if not records:
+        return
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -192,6 +210,8 @@ def save_plots(outdir, records, snapshots, grid):
         ax.set(xlabel="Physical time", ylabel=label)
         ax.grid(alpha=0.25)
         ax.legend()
+    if status_note:
+        fig.suptitle(status_note)
     fig.tight_layout()
     fig.savefig(outdir / "benchmark.png", dpi=160)
     plt.close(fig)
@@ -201,10 +221,14 @@ def save_plots(outdir, records, snapshots, grid):
     ax.plot(times, [r["fourth_moment_exact"] for r in records], "k--", label="BKW")
     ax.set(xlabel="Physical time", ylabel="Radial fourth moment (extra diagnostic)")
     ax.legend()
+    if status_note:
+        fig.suptitle(status_note)
     fig.tight_layout()
     fig.savefig(outdir / "fourth_moment.png", dpi=160)
     plt.close(fig)
 
+    if not snapshots:
+        return  # Older failed runs have CSV diagnostics but no snapshot archive.
     fig, axes = plt.subplots(2, len(snapshots), figsize=(4 * len(snapshots), 6), squeeze=False)
     for col, snap in enumerate(snapshots):
         for row, prefix, label in [(0, "density", "Density slice"), (1, "score", "Score component 1")]:
@@ -214,9 +238,34 @@ def save_plots(outdir, records, snapshots, grid):
             ax.set(xlabel="v1 (other coordinates zero)", ylabel=label, title=f"t={snap['time']:.4g}")
             ax.grid(alpha=0.25)
             ax.legend()
+    if status_note:
+        fig.suptitle(status_note)
     fig.tight_layout()
     fig.savefig(outdir / "density_score_slices.png", dpi=160)
     plt.close(fig)
+
+
+def plot_partial_run(input_dir, output_dir):
+    """Recover BKW time-series plots without claiming final-time convergence."""
+    config = json.loads((input_dir / "config.json").read_text())
+    if config.get("example") != "bkw":
+        raise ValueError("Partial plotting requires a single BKW run directory")
+    with (input_dir / "metrics.csv").open() as handle:
+        records = [{key: float(value) if value else None for key, value in row.items()}
+                   for row in csv.DictReader(handle)]
+    if not records:
+        raise ValueError(f"No saved diagnostics in {input_dir}")
+    snapshots, grid = [], None
+    if (input_dir / "snapshots.npz").is_file():
+        with np.load(input_dir / "snapshots.npz", allow_pickle=False) as saved:
+            grid = saved["slice_grid"]
+            snapshots = [dict(time=t, **{key: saved[key][i] for key in
+                                        ("density_estimated", "density_exact", "score_estimated", "score_exact")})
+                         for i, t in enumerate(saved["t_traj"])]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    note = f"Partial diagnostics through t={records[-1]['time']:g}; requested final time {config['final_time']:g}"
+    save_plots(output_dir, records, snapshots, grid, status_note=note)
+    return output_dir / "benchmark.png"
 
 
 def main(argv=None):
@@ -264,81 +313,119 @@ def main(argv=None):
     points = jnp.zeros((len(grid), args.dv), dtype=dtype).at[:, 0].set(jnp.asarray(grid, dtype=dtype))
     started = time.perf_counter()
     last_step_metrics = dict(optimization_steps=0, gamma_squared_min=1.0, problematic_particle_count=0)
-    with (outdir / "metrics.csv").open("w", newline="") as metrics_file, (outdir / "optimization.csv").open("w", newline="") as optimization_file:
-        metric_writer = optimization_writer = None
+    stepper = None
+    completed_steps = 0
+    step, t = 0, args.t0
 
-        def log_fit(fit):
-            nonlocal optimization_writer
-            if optimization_writer is None:
-                optimization_writer = csv.DictWriter(optimization_file, fieldnames=fit)
-                optimization_writer.writeheader()
-            optimization_writer.writerow(fit)
-            optimization_file.flush()
+    def save_results(failure=None):
+        summary = dict(status="failed" if failure else "completed", initialization=initialization,
+                       initial=records[0] if records else None, final=records[-1] if records else None,
+                       num_steps=completed_steps, planned_num_steps=num_steps,
+                       last_valid_time=records[-1]["time"] if records else None,
+                       evolution=stepper.summary() if stepper is not None else None,
+                       simulation_wall_seconds=time.perf_counter() - started)
+        if failure:
+            summary["failure"] = failure
+        # Write status/data before rendering; a plotting failure must not erase them.
+        (outdir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        save_snapshots(outdir, snapshots, grid)
+        note = None
+        if failure and records:
+            note = (f"FAILED run: valid diagnostics through t={records[-1]['time']:g}; "
+                    f"requested final time {args.final_time:g}")
+        save_plots(outdir, records, snapshots, grid, status_note=note)
+        return summary
 
-        if args.score_method == "score_evolution":
-            stepper = ScoreEvolutionStepper(args, model, v, log_fit=log_fit)
-            config["score_evolution_bandwidth_resolved"] = (
-                stepper.bandwidth.tolist() if stepper.bandwidth is not None else None)
-            (outdir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-            if run:
-                run.config.update({"score_evolution_bandwidth_resolved":
-                                   config["score_evolution_bandwidth_resolved"]})
-        else:
-            stepper = HomogeneousStepper(args, model, optimizer, log_fit=log_fit,
-                                         exact_score=lambda velocity, time: bkw_score(velocity, time, args.B))
-        for step in range(num_steps + 1):
-            t = min(args.t0 + step * args.dt, args.final_time)
-            # Train only for actual transport steps; final diagnostics reuse weights.
-            s, collision = (stepper.start_step(v, t, step) if step < num_steps
-                            else stepper.evaluate(v, t))
-            snapshot_due = step % args.snapshot_every == 0 or step == num_steps
-            density_due = step % args.density_every == 0 or snapshot_due
-            if step % args.log_every == 0 or density_due or step == num_steps:
-                record = dict(step=step, time=t, elapsed_time=t - args.t0,
-                              **benchmark_metrics(v, s, collision, t, initial_mean, initial_energy, args.B),
-                              **last_step_metrics, density_l2=None, density_relative_l2=None,
-                              **{f"density_bandwidth_{i+1}": None for i in range(args.dv)},
-                              wall_seconds=0.0)
-                if density_due:
-                    absolute, relative, h = density_l2_error(v, t, args.B, args.block_size)
-                    if not math.isfinite(absolute) or not math.isfinite(relative):
-                        raise FloatingPointError(f"Nonfinite density diagnostic at t={t}")
-                    record.update(density_l2=absolute, density_relative_l2=relative)
-                    record.update({f"density_bandwidth_{i+1}": float(h[i]) for i in range(args.dv)})
-                record["wall_seconds"] = time.perf_counter() - started
-                if metric_writer is None:
-                    metric_writer = csv.DictWriter(metrics_file, fieldnames=record)
-                    metric_writer.writeheader()
-                metric_writer.writerow(record)
-                metrics_file.flush()
-                records.append(record)
+    try:
+        with (outdir / "metrics.csv").open("w", newline="") as metrics_file, (outdir / "optimization.csv").open("w", newline="") as optimization_file:
+            metric_writer = optimization_writer = None
+
+            def log_fit(fit):
+                nonlocal optimization_writer
+                if optimization_writer is None:
+                    optimization_writer = csv.DictWriter(optimization_file, fieldnames=fit)
+                    optimization_writer.writeheader()
+                optimization_writer.writerow(fit)
+                optimization_file.flush()
+
+            if args.score_method == "score_evolution":
+                stepper = ScoreEvolutionStepper(args, model, v, log_fit=log_fit)
+                config["score_evolution_bandwidth_resolved"] = (
+                    stepper.bandwidth.tolist() if stepper.bandwidth is not None else None)
+                (outdir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
                 if run:
-                    run.log({k: value for k, value in record.items() if value is not None}, step=step)
-                if density_due:
-                    print(f"t={t:.5g}: relative score MSE={record['score_relative_mse']:.4g}, "
-                          f"density L2={record['density_l2']:.4g}, energy drift={record['relative_energy_drift']:.3g}", flush=True)
-            if snapshot_due:
-                density_estimated, score_kde = gaussian_kde(points, v, scott_bandwidth(v), args.block_size)
-                score_exact = bkw_score(points, t, args.B)
-                if args.score_method in ("sbtm", "score_evolution"):
-                    score_estimated = model(jnp.empty((len(points), 0), dtype=dtype), points)
-                else:
-                    score_estimated = score_kde if args.score_method == "blob" else score_exact
-                snapshots.append(dict(time=t, v=np.asarray(v), density_estimated=np.asarray(density_estimated),
-                                      density_exact=np.asarray(bkw_density(points, t, args.B)),
-                                      score_estimated=np.asarray(score_estimated[:, 0]), score_exact=np.asarray(score_exact[:, 0])))
-            if step < num_steps:
-                next_time = min(args.t0 + (step + 1) * args.dt, args.final_time)
-                v, last_step_metrics = stepper.advance(v, t, next_time - t, step, (s, collision))
+                    run.config.update({"score_evolution_bandwidth_resolved":
+                                       config["score_evolution_bandwidth_resolved"]})
+            else:
+                stepper = HomogeneousStepper(args, model, optimizer, log_fit=log_fit,
+                                             exact_score=lambda velocity, time: bkw_score(velocity, time, args.B))
+            for step in range(num_steps + 1):
+                t = min(args.t0 + step * args.dt, args.final_time)
+                # Train only for actual transport steps; final diagnostics reuse weights.
+                s, collision = (stepper.start_step(v, t, step) if step < num_steps
+                                else stepper.evaluate(v, t))
+                snapshot_due = step % args.snapshot_every == 0 or step == num_steps
+                density_due = step % args.density_every == 0 or snapshot_due
+                if step % args.log_every == 0 or density_due or step == num_steps:
+                    record = dict(step=step, time=t, elapsed_time=t - args.t0,
+                                  **benchmark_metrics(v, s, collision, t, initial_mean, initial_energy, args.B),
+                                  **last_step_metrics, density_l2=None, density_relative_l2=None,
+                                  **{f"density_bandwidth_{i+1}": None for i in range(args.dv)},
+                                  wall_seconds=0.0)
+                    if density_due:
+                        absolute, relative, h = density_l2_error(v, t, args.B, args.block_size)
+                        if not math.isfinite(absolute) or not math.isfinite(relative):
+                            raise FloatingPointError(f"Nonfinite density diagnostic at t={t}")
+                        record.update(density_l2=absolute, density_relative_l2=relative)
+                        record.update({f"density_bandwidth_{i+1}": float(h[i]) for i in range(args.dv)})
+                    record["wall_seconds"] = time.perf_counter() - started
+                    if metric_writer is None:
+                        metric_writer = csv.DictWriter(metrics_file, fieldnames=record)
+                        metric_writer.writeheader()
+                    metric_writer.writerow(record)
+                    metrics_file.flush()
+                    records.append(record)
+                    if run:
+                        run.log({k: value for k, value in record.items() if value is not None}, step=step)
+                    if density_due:
+                        print(f"t={t:.5g}: relative score MSE={record['score_relative_mse']:.4g}, "
+                              f"density L2={record['density_l2']:.4g}, energy drift={record['relative_energy_drift']:.3g}", flush=True)
+                if snapshot_due:
+                    density_estimated, score_kde = gaussian_kde(points, v, scott_bandwidth(v), args.block_size)
+                    score_exact = bkw_score(points, t, args.B)
+                    if args.score_method in ("sbtm", "score_evolution"):
+                        score_estimated = model(jnp.empty((len(points), 0), dtype=dtype), points)
+                    else:
+                        score_estimated = score_kde if args.score_method == "blob" else score_exact
+                    snapshot = dict(time=t, v=np.asarray(v), density_estimated=np.asarray(density_estimated),
+                                    density_exact=np.asarray(bkw_density(points, t, args.B)),
+                                    score_estimated=np.asarray(score_estimated[:, 0]), score_exact=np.asarray(score_exact[:, 0]))
+                    if args.score_method == "score_evolution":
+                        snapshot["theta"] = np.asarray(stepper.theta)
+                    if not all(np.all(np.isfinite(value)) for value in snapshot.values()):
+                        raise FloatingPointError(f"Nonfinite snapshot at t={t}")
+                    snapshots.append(snapshot)
+                    save_snapshots(outdir, snapshots, grid)
+                if step < num_steps:
+                    next_time = min(args.t0 + (step + 1) * args.dt, args.final_time)
+                    v, last_step_metrics = stepper.advance(v, t, next_time - t, step, (s, collision))
+                    completed_steps = step + 1
 
-    np.savez_compressed(outdir / "snapshots.npz", t_traj=np.array([s["time"] for s in snapshots]),
-                        v_traj=np.stack([s["v"] for s in snapshots]), slice_grid=grid,
-                        **{name: np.stack([s[name] for s in snapshots]) for name in
-                           ["density_estimated", "density_exact", "score_estimated", "score_exact"]})
-    save_plots(outdir, records, snapshots, grid)
-    summary = {"initialization": initialization, "initial": records[0], "final": records[-1],
-               "num_steps": num_steps, "evolution": stepper.summary(), "simulation_wall_seconds": time.perf_counter() - started}
-    (outdir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    except Exception as error:
+        failure = dict(type=type(error).__name__, message=str(error), step=step, time=t)
+        try:
+            save_results(failure)
+            print(f"Run failed. Partial diagnostics saved in {outdir}", file=sys.stderr, flush=True)
+        except Exception as output_error:
+            print(f"Could not finish saving partial diagnostics: {output_error}", file=sys.stderr, flush=True)
+        if run:
+            try:
+                run.finish(exit_code=1)
+            except Exception as tracking_error:
+                print(f"Could not close failed tracking run: {tracking_error}", file=sys.stderr, flush=True)
+        raise  # Preserve the original failure and the scheduler's nonzero exit status.
+
+    summary = save_results()
     from src.homogeneous_plots import plot_benchmarks
     plot_benchmarks([dict(config=config, records=records, summary=summary, path=str(outdir))], outdir)
     if run:
