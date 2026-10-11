@@ -48,6 +48,7 @@ from src.homogeneous import (
 from src.score_evolution import (
     ScoreEvolutionStepper, add_score_evolution_arguments, validate_score_evolution_args,
 )
+from src.bkw_snapshot_plots import PLANE_FIELDS, PLANE_METADATA, save_plane_plots
 
 
 def bkw_parameters(t, d=3, B=1 / 24):
@@ -126,7 +127,11 @@ def parse_args(argv=None):
                     time_integrators=("energy_conserving", "forward_euler", "midpoint"),
                     default_time_integrator=None)
     add_score_evolution_arguments(p)
+    p.add_argument("--plane_grid_size", type=int, default=65,
+                   help="Points per axis in saved velocity-plane plots (>=3)")
     args = validate_args(validate_score_evolution_args(p.parse_args(argv), p), p)
+    if args.plane_grid_size < 3:
+        p.error("plane_grid_size must be >= 3")
     threshold = math.log(args.dv / 2 + 1) / (2 * args.B * (args.dv - 1))
     if args.t0 <= threshold:
         p.error(f"t0 must exceed {threshold:.12g} for a positive, nonsingular BKW density")
@@ -170,6 +175,35 @@ def benchmark_metrics(v, s, collision, t, initial_mean, initial_energy, B):
     return result
 
 
+def velocity_plane_snapshot(v, t, B, score_method, model=None, *, block_size=128, grid_size=65):
+    """Full-dimensional density/score on coordinate planes, not marginals.
+
+    Use all pairs among the first three coordinates (one pair when d=2).
+    Keeping the full score vector also exposes errors normal to each plane.
+    """
+    d = v.shape[1]
+    grid = np.linspace(-4, 4, grid_size)
+    pairs = np.array([(a, b) for a in range(min(d, 3)) for b in range(a + 1, min(d, 3))])
+    x, y = np.meshgrid(grid, grid, indexing="xy")
+    points = np.zeros((len(pairs), grid_size, grid_size, d))
+    for plane, (a, b) in enumerate(pairs):
+        points[plane, :, :, a] = x
+        points[plane, :, :, b] = y
+    points = jnp.asarray(points.reshape(-1, d), dtype=v.dtype)
+    density, kde_score = gaussian_kde(points, v, scott_bandwidth(v), block_size)
+    exact_score = bkw_score(points, t, B)
+    if score_method in ("sbtm", "score_evolution"):
+        computed_score = model(jnp.empty((len(points), 0), dtype=v.dtype), points)
+    else:
+        computed_score = kde_score if score_method == "blob" else exact_score
+    shape = (len(pairs), grid_size, grid_size)
+    return dict(plane_grid=grid, plane_pairs=pairs,
+                plane_density_estimated=np.asarray(density).reshape(shape),
+                plane_density_exact=np.asarray(bkw_density(points, t, B)).reshape(shape),
+                plane_score_estimated=np.asarray(computed_score).reshape(*shape, d),
+                plane_score_exact=np.asarray(exact_score).reshape(*shape, d))
+
+
 def save_snapshots(outdir, snapshots, grid):
     """Replace the snapshot archive only after the new archive is written."""
     if not snapshots:
@@ -180,6 +214,9 @@ def save_snapshots(outdir, snapshots, grid):
                    ("density_estimated", "density_exact", "score_estimated", "score_exact")})
     if "theta" in snapshots[0]:
         arrays["theta_traj"] = np.stack([s["theta"] for s in snapshots])
+    if all(name in snapshots[0] for name in (*PLANE_METADATA, *PLANE_FIELDS)):
+        arrays.update({name: snapshots[0][name] for name in PLANE_METADATA})
+        arrays.update({name: np.stack([s[name] for s in snapshots]) for name in PLANE_FIELDS})
     temporary = outdir / ".snapshots.tmp.npz"
     np.savez_compressed(temporary, **arrays)
     temporary.replace(outdir / "snapshots.npz")
@@ -243,6 +280,7 @@ def save_plots(outdir, records, snapshots, grid, *, status_note=None):
     fig.tight_layout()
     fig.savefig(outdir / "density_score_slices.png", dpi=160)
     plt.close(fig)
+    save_plane_plots(outdir, snapshots, status_note=status_note)
 
 
 def plot_partial_run(input_dir, output_dir):
@@ -262,6 +300,10 @@ def plot_partial_run(input_dir, output_dir):
             snapshots = [dict(time=t, **{key: saved[key][i] for key in
                                         ("density_estimated", "density_exact", "score_estimated", "score_exact")})
                          for i, t in enumerate(saved["t_traj"])]
+            if all(key in saved for key in (*PLANE_METADATA, *PLANE_FIELDS)):
+                for i, snapshot in enumerate(snapshots):
+                    snapshot.update({key: saved[key] for key in PLANE_METADATA})
+                    snapshot.update({key: saved[key][i] for key in PLANE_FIELDS})
     output_dir.mkdir(parents=True, exist_ok=True)
     note = f"Partial diagnostics through t={records[-1]['time']:g}; requested final time {config['final_time']:g}"
     save_plots(output_dir, records, snapshots, grid, status_note=note)
@@ -400,6 +442,9 @@ def main(argv=None):
                     snapshot = dict(time=t, v=np.asarray(v), density_estimated=np.asarray(density_estimated),
                                     density_exact=np.asarray(bkw_density(points, t, args.B)),
                                     score_estimated=np.asarray(score_estimated[:, 0]), score_exact=np.asarray(score_exact[:, 0]))
+                    snapshot.update(velocity_plane_snapshot(
+                        v, t, args.B, args.score_method, model, block_size=args.block_size,
+                        grid_size=args.plane_grid_size))
                     if args.score_method == "score_evolution":
                         snapshot["theta"] = np.asarray(stepper.theta)
                     if not all(np.all(np.isfinite(value)) for value in snapshot.values()):
