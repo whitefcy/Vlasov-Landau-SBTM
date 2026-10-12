@@ -92,7 +92,11 @@ def make_parser(description, *, score_methods=("sbtm", "blob", "exact"),
     p.add_argument("--sbtm_activation", choices=("soft_sign", "tanh"), default=None,
                    help="Score-network activation; defaults to tanh for score-evolution transport "
                         "modes, otherwise soft_sign")
-    p.add_argument("--sbtm_batch_size", type=int, default=1024)
+    p.add_argument("--sbtm_batch_size", type=int, default=1024,
+                   help="Supervised initialization batch size and SBTM evolution minibatch size")
+    p.add_argument("--sbtm_use_batches", action=argparse.BooleanOptionalAction, default=True,
+                   help="Use minibatches for SBTM evolution; --no-sbtm_use_batches uses all "
+                        "simulation particles per optimizer update. Initialization still uses sbtm_batch_size")
     p.add_argument("--sbtm_n_initial", type=int, default=None,
                    help="Independent particles used only for supervised initial score fitting; "
                         "default reuses the n simulation particles")
@@ -110,7 +114,11 @@ def make_parser(description, *, score_methods=("sbtm", "blob", "exact"),
     p.add_argument("--sbtm_training_stages", choices=["stage0_only", "all_stages"],
                    default="stage0_only",
                    help="Train once at step start or at all three energy-conserving stages")
-    p.add_argument("--sbtm_div_mode", choices=["exact", "approximate_rademacher"], default="exact")
+    p.add_argument("--sbtm_div_mode", choices=["exact", "denoised", "approximate_rademacher"], default="exact",
+                   help="SBTM evolution loss: exact divergence, IHW25 Eq. (3.5) denoising, "
+                        "or Hutchinson divergence")
+    p.add_argument("--sbtm_denoising_alpha", type=float, default=0.4,
+                   help="Positive noise scale for denoised mode (IHW25 uses 0.4)")
     p.add_argument("--sbtm_min_steps", type=int, default=10)
     p.add_argument("--sbtm_check_every", type=int, default=5)
     p.add_argument("--sbtm_patience", type=int, default=3)
@@ -131,7 +139,8 @@ def validate_args(args, p):
         args.sbtm_activation = "tanh" if transport else "soft_sign"
     positive = ["B", "dt", "block_size", "log_every", "density_every", "snapshot_every",
                 "sbtm_batch_size", "sbtm_num_epochs", "sbtm_lr", "sbtm_num_batch_steps",
-                "sbtm_min_steps", "sbtm_check_every", "sbtm_patience", "sbtm_monitor_size"]
+                "sbtm_min_steps", "sbtm_check_every", "sbtm_patience", "sbtm_monitor_size",
+                "sbtm_denoising_alpha"]
     if any(not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0 for name in positive):
         p.error("Step sizes, counts, B, and learning rate must be finite and positive")
     if args.n < 2 or args.dv < 2 or min(args.sbtm_hidden_dims) < 1:
@@ -187,7 +196,8 @@ class HomogeneousStepper:
                                 adaptive=a.sbtm_adaptive, min_steps=a.sbtm_min_steps,
                                 check_every=a.sbtm_check_every, patience=a.sbtm_patience,
                                 atol=a.sbtm_stop_atol, rtol=a.sbtm_stop_rtol,
-                                monitor_size=a.sbtm_monitor_size, div_mode=a.sbtm_div_mode)
+                                monitor_size=a.sbtm_monitor_size, div_mode=a.sbtm_div_mode,
+                                use_batches=a.sbtm_use_batches, denoising_alpha=a.sbtm_denoising_alpha)
                 self.training_passes += 1
             else:
                 fit = dict(optimization_steps=0, stop_reason="reused_stage0", initial_loss=None,

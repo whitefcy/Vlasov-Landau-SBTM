@@ -1,4 +1,5 @@
 """Score fitting with a fixed monitoring batch and per-evaluation diagnostics."""
+import math
 import time
 
 import jax
@@ -9,10 +10,11 @@ from flax import nnx
 from src.loss import implicit_score_matching_loss
 
 
-@nnx.jit(static_argnames=('div_mode',))
-def _update(model, optimizer, x, v, key, div_mode):
+@nnx.jit(static_argnames=('div_mode', 'denoising_alpha'))
+def _update(model, optimizer, x, v, key, div_mode, denoising_alpha=0.4):
     def objective(model):
-        return implicit_score_matching_loss(model, x, v, key, div_mode=div_mode)
+        return implicit_score_matching_loss(model, x, v, key, div_mode=div_mode,
+                                           denoising_alpha=denoising_alpha)
     value, grads = nnx.value_and_grad(objective)(model)
     # Flax <0.11 keeps the model on the optimizer; newer releases require it.
     if hasattr(optimizer, 'model'):
@@ -24,10 +26,14 @@ def _update(model, optimizer, x, v, key, div_mode):
 
 def fit_score(model, optimizer, x, v, key, *, batch_size, max_steps=100,
               adaptive=True, min_steps=10, check_every=5, patience=3,
-              atol=1e-5, rtol=1e-4, monitor_size=2048, div_mode='exact'):
+              atol=1e-5, rtol=1e-4, monitor_size=2048, div_mode='exact',
+              use_batches=True, denoising_alpha=0.4):
     """Stop after patience consecutive small changes in a fixed-batch loss.
 
-    The monitor always uses exact divergence, including in Hutchinson ablations.
+    The monitor always uses exact divergence, including when training with
+    denoising or Hutchinson probes. use_batches=False uses all particles for
+    every optimizer update, independently of batch_size. Denoising draws new
+    Gaussian probes at each update in either batching mode.
     A small change means abs(new-old) <= atol + rtol*max(abs(old), abs(new)).
     This is a plateau heuristic, not a bound on score error. The optimizer and
     model are warm-started across calls; monitoring state resets at each stage.
@@ -40,6 +46,10 @@ def fit_score(model, optimizer, x, v, key, *, batch_size, max_steps=100,
         raise ValueError('Tolerances must be finite and nonnegative')
     if x.shape[0] != v.shape[0] or x.shape[0] == 0:
         raise ValueError('Expected equal, nonempty particle arrays')
+    if div_mode not in ('exact', 'approximate_rademacher', 'denoised'):
+        raise ValueError(f'Unsupported divergence mode: {div_mode}')
+    if not math.isfinite(denoising_alpha) or denoising_alpha <= 0:
+        raise ValueError('denoising_alpha must be finite and positive')
     started = time.perf_counter()
     key, monitor_key = jr.split(key)
     ids = jr.permutation(monitor_key, x.shape[0])[:monitor_size]
@@ -59,14 +69,18 @@ def fit_score(model, optimizer, x, v, key, *, batch_size, max_steps=100,
     # Random batches without replacement within each pass through the particles.
     offset = x.shape[0]
     for steps in range(1, max_steps + 1):
-        if offset >= x.shape[0]:
-            key, permutation_key = jr.split(key)
-            order = jr.permutation(permutation_key, x.shape[0])
-            offset = 0
-        ids = order[offset:offset + batch_size]
-        offset += batch_size
+        if use_batches:
+            if offset >= x.shape[0]:
+                key, permutation_key = jr.split(key)
+                order = jr.permutation(permutation_key, x.shape[0])
+                offset = 0
+            ids = order[offset:offset + batch_size]
+            offset += batch_size
+            xb, vb = x[ids], v[ids]
+        else:
+            xb, vb = x, v
         key, update_key = jr.split(key)
-        train_loss = _update(model, optimizer, x[ids], v[ids], update_key, div_mode)
+        train_loss = _update(model, optimizer, xb, vb, update_key, div_mode, denoising_alpha)
         if steps % check_every == 0 or steps == max_steps:
             if not bool(jnp.isfinite(train_loss)):
                 raise FloatingPointError('Nonfinite score-matching training loss')

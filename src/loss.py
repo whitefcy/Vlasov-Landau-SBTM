@@ -1,3 +1,5 @@
+import math
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -118,15 +120,24 @@ def weighted_explicit_score_matching_loss(s, x_batch, v_batch, target_score_valu
     
     return jnp.mean(jax.vmap(weighted_loss)(x_batch, v_batch, target_score_values, weighting))
 
-@nnx.jit(static_argnames=('div_mode', 'n_samples'))
-def implicit_score_matching_loss(s, x_batch, v_batch, key, div_mode='approximate_rademacher', n_samples: int = 1):
+@nnx.jit(static_argnames=('div_mode', 'n_samples', 'denoising_alpha'))
+def implicit_score_matching_loss(s, x_batch, v_batch, key, div_mode='approximate_rademacher',
+                                 n_samples: int = 1, denoising_alpha: float = 0.4):
     """
     1/|B| ∑ (‖s(x,v)‖² + 2 div_v s(x,v)).
     Exact mode traces the velocity Jacobian; approximate_rademacher uses
     independent Hutchinson probes per particle. Exact mode ignores key.
+    Denoised mode implements IHW25 Eq. (3.5): keep the score norm at the
+    unperturbed velocity and estimate 2 div s using the central difference
+    (s(v + alpha Z) - s(v - alpha Z)) . Z / alpha. Gaussian probes are
+    independent per particle; n_samples=1 matches the paper.
     """
-    if div_mode not in ('exact', 'approximate_rademacher'):
+    if div_mode not in ('exact', 'approximate_rademacher', 'denoised'):
         raise ValueError(f"Unsupported divergence mode: {div_mode}")
+    if n_samples < 1:
+        raise ValueError('n_samples must be positive')
+    if div_mode == 'denoised' and (not math.isfinite(denoising_alpha) or denoising_alpha <= 0):
+        raise ValueError('denoising_alpha must be finite and positive')
     if x_batch.ndim < v_batch.ndim:
         x_batch = x_batch[:, None]
     if div_mode == 'exact':
@@ -138,12 +149,16 @@ def implicit_score_matching_loss(s, x_batch, v_batch, key, div_mode='approximate
             return jnp.sum(score * score) + 2.0 * jnp.trace(jac)
         return jax.vmap(exact_one)(x_batch, v_batch).mean()
     # ε tensor:  (n_samples, B, dv)
-    eps = jax.random.rademacher(key, (n_samples,) + v_batch.shape, dtype=v_batch.dtype)
+    random_probe = jax.random.normal if div_mode == 'denoised' else jax.random.rademacher
+    eps = random_probe(key, (n_samples,) + v_batch.shape, dtype=v_batch.dtype)
 
     def loss_one(x, v, eps_v):
         score = s(x, v)
         # vmap over ε samples for this (x,v)
         def one_eps(e):
+            if div_mode == 'denoised':
+                difference = s(x, v + denoising_alpha * e) - s(x, v - denoising_alpha * e)
+                return jnp.vdot(difference, e) / (2 * denoising_alpha)
             _, jvp = jax.jvp(lambda vv: s(x, vv), (v,), (e,))
             return jnp.vdot(jvp, e)
         div = jax.vmap(one_eps)(eps_v).mean()
