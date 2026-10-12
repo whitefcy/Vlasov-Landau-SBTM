@@ -91,7 +91,7 @@ def make_parser(description, *, score_methods=("sbtm", "blob", "exact"),
     p.add_argument("--sbtm_hidden_dims", type=int, nargs="+", default=[100, 100])
     p.add_argument("--sbtm_activation", choices=("soft_sign", "tanh"), default=None,
                    help="Score-network activation; defaults to tanh for score-evolution transport "
-                        "(which needs second velocity derivatives), otherwise soft_sign")
+                        "modes, otherwise soft_sign")
     p.add_argument("--sbtm_batch_size", type=int, default=1024)
     p.add_argument("--sbtm_n_initial", type=int, default=None,
                    help="Independent particles used only for supervised initial score fitting; "
@@ -126,7 +126,8 @@ def make_parser(description, *, score_methods=("sbtm", "blob", "exact"),
 def validate_args(args, p):
     if args.sbtm_activation is None:
         transport = (args.score_method == "score_evolution"
-                     and getattr(args, "score_evolution_rhs", "kernel") == "transport")
+                     and getattr(args, "score_evolution_rhs", "kernel") in ("transport", "transport_analytic"))
+        # Match initialization across the learned and analytical transport RHS.
         args.sbtm_activation = "tanh" if transport else "soft_sign"
     positive = ["B", "dt", "block_size", "log_every", "density_every", "snapshot_every",
                 "sbtm_batch_size", "sbtm_num_epochs", "sbtm_lr", "sbtm_num_batch_steps",
@@ -161,7 +162,6 @@ class HomogeneousStepper:
         self.optimization_steps = 0
         self.total_optimization_steps = 0
         self.training_passes = 0
-        self.total_problematic_particles = 0
 
     def evaluate(self, v, t):
         """Evaluate the current score/flow without updating network weights."""
@@ -211,7 +211,6 @@ class HomogeneousStepper:
             v, t, dt, self.args.B, lambda velocity, time, stage: self.prepare(velocity, time, step, stage),
             time_integrator=self.args.time_integrator, initial_evaluation=initial_evaluation)
         count = int(jnp.sum(problematic))
-        self.total_problematic_particles += count
         gamma_min = float(jnp.min(gamma_squared))
         return result, dict(optimization_steps=self.optimization_steps,
                             gamma_squared_min=gamma_min if math.isfinite(gamma_min) else None,
@@ -219,8 +218,7 @@ class HomogeneousStepper:
 
     def summary(self):
         return dict(training_passes=self.training_passes,
-                    total_optimization_steps=self.total_optimization_steps,
-                    total_problematic_particle_count=self.total_problematic_particles)
+                    total_optimization_steps=self.total_optimization_steps)
 
 
 def initialize_model(args, v, key, exact_score, *, sample_initial):

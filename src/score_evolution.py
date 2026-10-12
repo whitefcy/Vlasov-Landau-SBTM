@@ -25,19 +25,24 @@ from src.time_integrators import homogeneous_step
 
 def add_score_evolution_arguments(parser):
     group = parser.add_argument_group("score evolution")
-    group.add_argument("--score_evolution_rhs", choices=("kernel", "transport"), default="kernel",
+    group.add_argument("--score_evolution_rhs", choices=("kernel", "transport", "transport_analytic"), default="kernel",
                        help="Eulerian score derivative R: Gaussian kernel approximation (default), "
-                            "or transport equation with velocity derivatives of the score network")
+                            "transport equation using the score network, or transport_analytic "
+                            "using the analytical score at the current source particles and stage time; "
+                            "particle motion still uses the network")
     group.add_argument("--score_evolution_regularization", type=float, default=1e-4,
                        help="Positive lambda in sum_p w_p |J xi - R|^2 + lambda |xi|^2")
     group.add_argument("--score_evolution_bandwidth", type=float, nargs="+", default=None,
                        help="Kernel RHS only: fixed Gaussian standard deviation(s), one or dv values; "
                             "default is diagonal Scott bandwidth from the initial particles; "
-                            "unused by transport")
+                            "unused by transport modes")
     group.add_argument("--score_evolution_cg_tol", type=float, default=1e-6,
                        help="Relative normal-equation residual tolerance for conjugate gradient")
     group.add_argument("--score_evolution_cg_maxiter", type=int, default=200,
                        help="Maximum conjugate-gradient iterations per stage")
+    group.add_argument("--score_evolution_cg_failure", choices=("warn", "error"), default="warn",
+                       help="Action when CG misses its residual tolerance: warn and continue "
+                            "(default), or error before applying the parameter update")
 
 
 def validate_score_evolution_args(args, parser):
@@ -235,9 +240,13 @@ class ScoreEvolutionStepper:
     Energy-conserving steps use one score-evolution solve at step start and
     reevaluate that step's unchanged network at all particle stages. The coupled
     method remains first order because the parameter update is forward Euler.
+    The optional exact_score(v, t) callback supplies only the transport_analytic
+    RHS, including source scores and query derivatives. This retains the finite
+    particle source sum; it is not the continuum time derivative of exact_score.
+    Particle motion and the parameter Jacobian always use the learned network.
     """
 
-    def __init__(self, args, model, initial_particles, *, log_fit=None):
+    def __init__(self, args, model, initial_particles, *, exact_score=None, log_fit=None):
         from flax import nnx
 
         if model is None:
@@ -248,6 +257,8 @@ class ScoreEvolutionStepper:
         self.model = model
         self.log_fit = log_fit
         self.rhs_method = args.score_evolution_rhs
+        if self.rhs_method == "transport_analytic" and exact_score is None:
+            raise ValueError("transport_analytic requires an exact_score(v, t) callback")
         self.weights = jnp.full((len(initial_particles),), 1 / len(initial_particles),
                                 dtype=initial_particles.dtype)
         self.bandwidth = None
@@ -270,8 +281,10 @@ class ScoreEvolutionStepper:
             return network(jnp.empty((len(v), 0), dtype=v.dtype), v)
 
         self._score = jax.jit(score)
-        self._transport_rhs = (make_transport_score_rhs(score, args.B, args.block_size)
-                               if self.rhs_method == "transport" else None)
+        self._transport_rhs = None
+        if self.rhs_method in ("transport", "transport_analytic"):
+            rhs_score = (lambda time, v: exact_score(v, time)) if self.rhs_method == "transport_analytic" else score
+            self._transport_rhs = make_transport_score_rhs(rhs_score, args.B, args.block_size)
         self._solve = make_parameter_velocity_solver(
             score, args.score_evolution_regularization,
             args.score_evolution_cg_tol, args.score_evolution_cg_maxiter)
@@ -280,7 +293,6 @@ class ScoreEvolutionStepper:
         self.linear_solves = 0
         self.unconverged_linear_solves = 0
         self.max_linear_relative_residual = 0.0
-        self.total_problematic_particles = 0
 
     def evaluate(self, v, t):
         """Evaluate the current network without fitting or advancing it."""
@@ -293,36 +305,48 @@ class ScoreEvolutionStepper:
 
     def _parameter_velocity(self, theta, v, acceleration, t, step, stage):
         started = time.perf_counter()
-        if self.rhs_method == "transport":
-            target = self._transport_rhs(theta, v, v, self.weights)
+        if self.rhs_method in ("transport", "transport_analytic"):
+            rhs_state = jnp.asarray(t, dtype=v.dtype) if self.rhs_method == "transport_analytic" else theta
+            target = self._transport_rhs(rhs_state, v, v, self.weights)
         else:
             target = gaussian_score_rhs(v, v, acceleration, self.bandwidth,
                                         self.weights, self.args.block_size)
         velocity, diagnostics = self._solve(theta, v, target, self.weights)
         values = {key: float(value) for key, value in diagnostics.items()
                   if key not in ("iterations", "valid", "converged")}
-        if (not bool(diagnostics["valid"]) or not all(map(math.isfinite, values.values()))
-                or not bool(jnp.all(jnp.isfinite(velocity)))):
-            raise FloatingPointError(f"Invalid score-evolution solve at t={t}, stage={stage}")
+        valid = (bool(diagnostics["valid"]) and all(map(math.isfinite, values.values()))
+                 and bool(jnp.all(jnp.isfinite(velocity))))
         iterations = int(diagnostics["iterations"])
-        converged = bool(diagnostics["converged"])
+        converged = valid and bool(diagnostics["converged"])
         self.optimization_steps += iterations
         self.total_optimization_steps += iterations
         self.linear_solves += 1
         self.unconverged_linear_solves += int(not converged)
-        self.max_linear_relative_residual = max(self.max_linear_relative_residual,
-                                                values["linear_relative_residual"])
-        if not converged:
-            warnings.warn("Score-evolution CG missed its residual tolerance; inspect optimization.csv "
-                          "and consider increasing --score_evolution_cg_maxiter or regularization.",
-                          RuntimeWarning, stacklevel=2)
+        if math.isfinite(values["linear_relative_residual"]):
+            self.max_linear_relative_residual = max(self.max_linear_relative_residual,
+                                                    values["linear_relative_residual"])
         if self.log_fit is not None:
             self.log_fit(dict(step=step + 1, time=t, stage=stage,
                               stage_name="n" if stage == 0 else "midpoint",
                               score_evolution_rhs=self.rhs_method,
                               optimization_steps=iterations, cg_converged=converged,
-                              stop_reason="converged" if converged else "residual_tolerance_not_met",
+                              stop_reason=("invalid_solve" if not valid else
+                                           "converged" if converged else "residual_tolerance_not_met"),
                               **values, optimization_seconds=time.perf_counter() - started))
+        if not valid:
+            raise FloatingPointError(f"Invalid score-evolution solve at t={t}, stage={stage}; "
+                                     "see optimization.csv for the failed solve")
+        if not converged:
+            message = (f"Score-evolution CG missed its residual tolerance at t={t:g}, stage={stage}: "
+                       f"relative residual={values['linear_relative_residual']:.6g}, "
+                       f"tolerance={self.args.score_evolution_cg_tol:g}, iterations={iterations}. "
+                       "Inspect optimization.csv and consider increasing "
+                       "--score_evolution_cg_maxiter or regularization.")
+            if self.args.score_evolution_cg_failure == "error":
+                raise RuntimeError(message)
+            if self.unconverged_linear_solves == 1:
+                warnings.warn(message + " Further misses are recorded in optimization.csv.",
+                              RuntimeWarning, stacklevel=2)
         return velocity
 
     def advance(self, v, t, dt, step, initial_evaluation=None):
@@ -352,6 +376,8 @@ class ScoreEvolutionStepper:
                 time_integrator="energy_conserving", initial_evaluation=initial)
             count = int(jnp.sum(problematic))
             gamma_min = float(jnp.min(gamma_squared))
+            # The shared integrator uses Gamma=1 for invalid corrections.
+            # Record only this step's fallback count and raw Gamma^2 minimum.
         else:
             v_new = v + dt * acceleration
             count, gamma_min = 0, 1.0
@@ -359,7 +385,6 @@ class ScoreEvolutionStepper:
             raise FloatingPointError(f"Nonfinite score-evolution state after t={t}")
         self.theta = theta_new
         nnx.update(self.model, self._unravel(theta_new))
-        self.total_problematic_particles += count
         return v_new, dict(optimization_steps=self.optimization_steps,
                            gamma_squared_min=gamma_min if math.isfinite(gamma_min) else None,
                            problematic_particle_count=count)
@@ -368,9 +393,9 @@ class ScoreEvolutionStepper:
         return dict(training_passes=0, linear_solves=self.linear_solves,
                     optimization_method="conjugate_gradient",
                     score_evolution_rhs=self.rhs_method,
+                    score_evolution_cg_failure=self.args.score_evolution_cg_failure,
                     total_optimization_steps=self.total_optimization_steps,
                     unconverged_linear_solves=self.unconverged_linear_solves,
                     max_linear_relative_residual=self.max_linear_relative_residual,
-                    total_problematic_particle_count=self.total_problematic_particles,
                     score_evolution_bandwidth=(self.bandwidth.tolist()
                                                if self.bandwidth is not None else None))

@@ -15,6 +15,10 @@ the exact BKW score, then evolve network parameters by weighted ridge least
 squares using an Eulerian Gaussian-particle score derivative. Select
 --score_evolution_rhs transport to use the score transport equation instead;
 its first and second velocity derivatives use a tanh network by default.
+Use --score_evolution_rhs transport_analytic for a diagnostic RHS computed
+with the analytical BKW score and its spatial derivatives on the current
+source particles. The parameter Jacobian and particle motion still use the
+learned network; this option also defaults to tanh for matched initialization.
 The default integrator for direct runs of this mode is forward_euler; midpoint and
 energy_conserving are also available. The energy-conserving option keeps the
 Euler parameter update and applies the project's three-stage Gamma-corrected
@@ -391,7 +395,8 @@ def main(argv=None):
                 optimization_file.flush()
 
             if args.score_method == "score_evolution":
-                stepper = ScoreEvolutionStepper(args, model, v, log_fit=log_fit)
+                stepper = ScoreEvolutionStepper(args, model, v, log_fit=log_fit,
+                    exact_score=lambda velocity, time: bkw_score(velocity, time, args.B))
                 config["score_evolution_bandwidth_resolved"] = (
                     stepper.bandwidth.tolist() if stepper.bandwidth is not None else None)
                 (outdir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
