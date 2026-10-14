@@ -10,6 +10,12 @@ differs from the paper's fixed 25 denoising updates with alpha=0.4. The blob
 mode uses the repository's Gaussian-KDE score convention (not the variational
 entropy gradient of every method called "blob" in the literature).
 
+Use --sbtm_div_mode denoised for IHW25 Eq. (3.5), with
+--sbtm_denoising_alpha 0.4 by default. --no-sbtm_use_batches uses all simulation
+particles for each evolution optimizer update; --sbtm_use_batches retains
+minibatches of size --sbtm_batch_size. Supervised initialization uses that
+batch size in both modes.
+
 The score_evolution mode implements Latex/VML equations.tex: initialize with
 the exact BKW score, then evolve network parameters by weighted ridge least
 squares using an Eulerian Gaussian-particle score derivative. Select
@@ -30,6 +36,7 @@ Example:
 """
 
 import csv
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
 import math
@@ -53,6 +60,7 @@ from src.score_evolution import (
     ScoreEvolutionStepper, add_score_evolution_arguments, validate_score_evolution_args,
 )
 from src.bkw_snapshot_plots import PLANE_FIELDS, PLANE_METADATA, save_plane_plots
+from src.score_evolution_diagnostics import DIAGNOSTIC_FIELDS, save_diagnostic_plot
 
 
 def bkw_parameters(t, d=3, B=1 / 24):
@@ -311,6 +319,7 @@ def plot_partial_run(input_dir, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
     note = f"Partial diagnostics through t={records[-1]['time']:g}; requested final time {config['final_time']:g}"
     save_plots(output_dir, records, snapshots, grid, status_note=note)
+    save_diagnostic_plot(input_dir, output_dir)
     return output_dir / "benchmark.png"
 
 
@@ -335,6 +344,9 @@ def main(argv=None):
     if args.score_method == "score_evolution":
         print(f"Score evolution: rhs={args.score_evolution_rhs}, "
               f"activation={args.sbtm_activation}", flush=True)
+        if args.score_evolution_diagnostics_every:
+            print(f"Score evolution trace: every {args.score_evolution_diagnostics_every} step(s), "
+                  f"{outdir / 'score_evolution_diagnostics.csv'}", flush=True)
     run = None
     if args.wandb_mode != "disabled":
         import wandb
@@ -375,6 +387,7 @@ def main(argv=None):
         # Write status/data before rendering; a plotting failure must not erase them.
         (outdir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         save_snapshots(outdir, snapshots, grid)
+        save_diagnostic_plot(outdir)
         note = None
         if failure and records:
             note = (f"FAILED run: valid diagnostics through t={records[-1]['time']:g}; "
@@ -383,8 +396,20 @@ def main(argv=None):
         return summary
 
     try:
-        with (outdir / "metrics.csv").open("w", newline="") as metrics_file, (outdir / "optimization.csv").open("w", newline="") as optimization_file:
+        tracing = args.score_method == "score_evolution" and args.score_evolution_diagnostics_every > 0
+        trace_context = ((outdir / "score_evolution_diagnostics.csv").open("w", newline="")
+                         if tracing else nullcontext(None))
+        with (outdir / "metrics.csv").open("w", newline="") as metrics_file, \
+                (outdir / "optimization.csv").open("w", newline="") as optimization_file, \
+                trace_context as trace_file:
             metric_writer = optimization_writer = None
+            if tracing:
+                trace_writer = csv.DictWriter(trace_file, fieldnames=DIAGNOSTIC_FIELDS)
+                trace_writer.writeheader()
+
+            def log_diagnostics(row):
+                trace_writer.writerow(row)
+                trace_file.flush()
 
             def log_fit(fit):
                 nonlocal optimization_writer
@@ -396,7 +421,8 @@ def main(argv=None):
 
             if args.score_method == "score_evolution":
                 stepper = ScoreEvolutionStepper(args, model, v, log_fit=log_fit,
-                    exact_score=lambda velocity, time: bkw_score(velocity, time, args.B))
+                    exact_score=lambda velocity, time: bkw_score(velocity, time, args.B),
+                    log_diagnostics=log_diagnostics if tracing else None)
                 config["score_evolution_bandwidth_resolved"] = (
                     stepper.bandwidth.tolist() if stepper.bandwidth is not None else None)
                 (outdir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -411,11 +437,19 @@ def main(argv=None):
                 # Train only for actual transport steps; final diagnostics reuse weights.
                 s, collision = (stepper.start_step(v, t, step) if step < num_steps
                                 else stepper.evaluate(v, t))
+                if args.score_method == "score_evolution":
+                    stepper.observe_state(v, t, step, (s, collision), force=step == num_steps)
                 snapshot_due = step % args.snapshot_every == 0 or step == num_steps
                 density_due = step % args.density_every == 0 or snapshot_due
                 if step % args.log_every == 0 or density_due or step == num_steps:
+                    try:
+                        metrics = benchmark_metrics(v, s, collision, t, initial_mean, initial_energy, args.B)
+                    except FloatingPointError:
+                        if tracing:
+                            stepper.observe_state(v, t, step, (s, collision), force=True)
+                        raise
                     record = dict(step=step, time=t, elapsed_time=t - args.t0,
-                                  **benchmark_metrics(v, s, collision, t, initial_mean, initial_energy, args.B),
+                                  **metrics,
                                   **last_step_metrics, density_l2=None, density_relative_l2=None,
                                   **{f"density_bandwidth_{i+1}": None for i in range(args.dv)},
                                   wall_seconds=0.0)

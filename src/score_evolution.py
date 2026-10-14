@@ -43,6 +43,9 @@ def add_score_evolution_arguments(parser):
     group.add_argument("--score_evolution_cg_failure", choices=("warn", "error"), default="warn",
                        help="Action when CG misses its residual tolerance: warn and continue "
                             "(default), or error before applying the parameter update")
+    group.add_argument("--score_evolution_diagnostics_every", type=int, default=0,
+                       help="Trace score/parameter/RHS amplitudes, derivatives and analytic controls "
+                            "every N steps (1 for onset tracing, 0 disables; adds derivative work)")
 
 
 def validate_score_evolution_args(args, parser):
@@ -61,6 +64,8 @@ def validate_score_evolution_args(args, parser):
             parser.error(f"{name} must be finite and positive")
     if args.score_evolution_cg_tol >= 1:
         parser.error("score_evolution_cg_tol must be less than 1")
+    if args.score_evolution_diagnostics_every < 0:
+        parser.error("score_evolution_diagnostics_every must be nonnegative")
     h = args.score_evolution_bandwidth
     if h is not None and (len(h) not in (1, args.dv)
                           or any(not math.isfinite(value) or value <= 0 for value in h)):
@@ -107,7 +112,7 @@ def gaussian_score_rhs(points, centers, accelerations, h, weights=None, block_si
     return jax.lax.map(evaluate, blocks).reshape(-1, d)[:m]
 
 
-def make_transport_score_rhs(score_function, B, block_size=128):
+def make_transport_score_rhs(score_function, B, block_size=128, *, return_details=False):
     """Build R = -Ds a - Da.T s - grad(div a) for Maxwell particles.
 
     ``score_function(theta, velocities)`` returns a batch of score vectors.
@@ -121,6 +126,8 @@ def make_transport_score_rhs(score_function, B, block_size=128):
     are differentiated, including second derivatives for grad(div a). A smooth
     score model is recommended. Blocking bounds derivative activation storage.
     The collision prefactor B is included exactly once here.
+    ``return_details`` also returns the three signed RHS terms and velocity
+    derivatives for observational diagnostics; the ordinary RHS is unchanged.
     """
     @jax.jit
     def evaluate(theta, points, centers, weights):
@@ -154,21 +161,41 @@ def make_transport_score_rhs(score_function, B, block_size=128):
         grad_div_a = jax.grad(lambda v: jnp.trace(jac_a(v)))
 
         def rhs(v):
-            return -jac_s(v) @ acceleration(v) - jac_a(v).T @ score(v) - grad_div_a(v)
+            if not return_details:
+                # Preserve the original evolution expression; probes are separate calls.
+                return -jac_s(v) @ acceleration(v) - jac_a(v).T @ score(v) - grad_div_a(v)
+            ds, da = jac_s(v), jac_a(v)
+            advection = -ds @ acceleration(v)
+            deformation = -da.T @ score(v)
+            divergence = -grad_div_a(v)
+            target = advection + deformation + divergence
+            return dict(rhs=target, advection=advection, deformation=deformation,
+                        divergence=divergence, score_jacobian=ds,
+                        score_hessian=jax.jacfwd(jac_s)(v))
 
         m, d = points.shape
         padding = (-m) % block_size
         blocks = jnp.pad(points, ((0, padding), (0, 0))).reshape(-1, block_size, d)
-        return jax.lax.map(jax.vmap(rhs), blocks).reshape(-1, d)[:m]
+        result = jax.lax.map(jax.vmap(rhs), blocks)
+        return jax.tree_util.tree_map(lambda x: x.reshape((-1,) + x.shape[2:])[:m], result)
 
     return evaluate
 
 
-def _conjugate_gradient(operator, rhs, tol, maxiter):
-    """Zero-start CG for a positive-definite operator, including iteration count."""
+def _conjugate_gradient(operator, rhs, tol, maxiter, x0=None):
+    """CG with an optional initial guess and tolerance relative to the RHS."""
     rhs_squared = jnp.vdot(rhs, rhs).real
     threshold = tol**2 * rhs_squared
-    initial = (jnp.array(0), jnp.zeros_like(rhs), rhs, rhs, rhs_squared, jnp.array(True))
+    if x0 is None:
+        solution, residual = jnp.zeros_like(rhs), rhs
+    else:
+        # A zero RHS has the exact zero solution, regardless of the old velocity.
+        solution = jnp.where(rhs_squared == 0, jnp.zeros_like(rhs),
+                             jnp.asarray(x0, dtype=rhs.dtype))
+        residual = rhs - operator(solution)
+    residual_squared = jnp.vdot(residual, residual).real
+    valid = jnp.isfinite(residual_squared) & jnp.all(jnp.isfinite(solution))
+    initial = (jnp.array(0), solution, residual, residual, residual_squared, valid)
 
     def condition(state):
         count, _, _, _, residual_squared, valid = state
@@ -199,9 +226,11 @@ def make_parameter_velocity_solver(score_function, regularization, tol, maxiter)
     forward map and its transpose provide JVPs/VJPs without storing either J
     or the parameter-by-parameter normal matrix. The particle weights multiply
     the squared vector residual; there is no extra division by d or n.
+    The returned solve accepts an optional ``initial_velocity`` for warm starts.
+    ``initial_loss`` remains the zero-velocity baseline (the squared target norm).
     """
     @jax.jit
-    def solve(theta, v, target, weights):
+    def solve(theta, v, target, weights, initial_velocity=None):
         _, push = jax.linearize(lambda parameters: score_function(parameters, v), theta)
         pull = jax.linear_transpose(push, jnp.zeros_like(theta))
 
@@ -209,7 +238,8 @@ def make_parameter_velocity_solver(score_function, regularization, tol, maxiter)
             return pull(weights[:, None] * push(vector))[0] + regularization * vector
 
         rhs = pull(weights[:, None] * target)[0]
-        velocity, iterations, valid = _conjugate_gradient(normal, rhs, tol, maxiter)
+        velocity, iterations, valid = _conjugate_gradient(
+            normal, rhs, tol, maxiter, x0=initial_velocity)
         residual = push(velocity) - target
         fit_residual_squared = jnp.sum(weights[:, None] * residual**2)
         rhs_norm = jnp.linalg.norm(rhs)
@@ -244,9 +274,12 @@ class ScoreEvolutionStepper:
     RHS, including source scores and query derivatives. This retains the finite
     particle source sum; it is not the continuum time derivative of exact_score.
     Particle motion and the parameter Jacobian always use the learned network.
+    CG starts from the previous completed step's parameter velocity (zero for
+    the first step); the midpoint solve starts from its first-stage velocity.
     """
 
-    def __init__(self, args, model, initial_particles, *, exact_score=None, log_fit=None):
+    def __init__(self, args, model, initial_particles, *, exact_score=None, log_fit=None,
+                 log_diagnostics=None):
         from flax import nnx
 
         if model is None:
@@ -281,6 +314,10 @@ class ScoreEvolutionStepper:
             return network(jnp.empty((len(v), 0), dtype=v.dtype), v)
 
         self._score = jax.jit(score)
+        self.diagnostics = None
+        if getattr(args, "score_evolution_diagnostics_every", 0) and log_diagnostics is not None:
+            from src.score_evolution_diagnostics import ScoreEvolutionDiagnostics
+            self.diagnostics = ScoreEvolutionDiagnostics(args, self._score, exact_score, log_diagnostics)
         self._transport_rhs = None
         if self.rhs_method in ("transport", "transport_analytic"):
             rhs_score = (lambda time, v: exact_score(v, time)) if self.rhs_method == "transport_analytic" else score
@@ -288,6 +325,7 @@ class ScoreEvolutionStepper:
         self._solve = make_parameter_velocity_solver(
             score, args.score_evolution_regularization,
             args.score_evolution_cg_tol, args.score_evolution_cg_maxiter)
+        self._previous_parameter_velocity = jnp.zeros_like(self.theta)
         self.optimization_steps = 0
         self.total_optimization_steps = 0
         self.linear_solves = 0
@@ -303,7 +341,13 @@ class ScoreEvolutionStepper:
         self.optimization_steps = 0
         return self.evaluate(v, t)
 
-    def _parameter_velocity(self, theta, v, acceleration, t, step, stage):
+    def observe_state(self, v, t, step, evaluation, *, force=False):
+        """Write diagnostics before benchmark reductions can overflow."""
+        if self.diagnostics is not None:
+            self.diagnostics.state(self.theta, v, t, step, evaluation, force=force)
+
+    def _parameter_velocity(self, theta, v, acceleration, t, step, stage,
+                            initial_velocity=None, dt=None):
         started = time.perf_counter()
         if self.rhs_method in ("transport", "transport_analytic"):
             rhs_state = jnp.asarray(t, dtype=v.dtype) if self.rhs_method == "transport_analytic" else theta
@@ -311,7 +355,15 @@ class ScoreEvolutionStepper:
         else:
             target = gaussian_score_rhs(v, v, acceleration, self.bandwidth,
                                         self.weights, self.args.block_size)
-        velocity, diagnostics = self._solve(theta, v, target, self.weights)
+        context = None
+        if self.diagnostics is not None:
+            context = self.diagnostics.rhs(theta, v, acceleration, target, t, step, stage, dt)
+        if initial_velocity is None:
+            initial_velocity = self._previous_parameter_velocity
+        velocity, diagnostics = self._solve(theta, v, target, self.weights, initial_velocity)
+        if self.diagnostics is not None:
+            self.diagnostics.solve(theta, v, acceleration, target, velocity, diagnostics,
+                                   context, t, step, stage, dt)
         values = {key: float(value) for key, value in diagnostics.items()
                   if key not in ("iterations", "valid", "converged")}
         valid = (bool(diagnostics["valid"]) and all(map(math.isfinite, values.values()))
@@ -357,22 +409,30 @@ class ScoreEvolutionStepper:
         # maxwell_collision excludes B; apply the prefactor exactly once.
         acceleration = -self.args.B * initial[1]
         theta_n = self.theta
-        parameter_velocity = self._parameter_velocity(theta_n, v, acceleration, t, step, 0)
+        stage_dt = 0.5 * dt if self.args.time_integrator == "midpoint" else dt
+        parameter_velocity = self._parameter_velocity(theta_n, v, acceleration, t, step, 0, dt=stage_dt)
         if self.args.time_integrator == "midpoint":
             theta_half = theta_n + (0.5 * dt) * parameter_velocity
             v_half = v + (0.5 * dt) * acceleration
             score_half = self._score(theta_half, v_half)
             acceleration = -self.args.B * maxwell_collision(v_half, score_half)
             parameter_velocity = self._parameter_velocity(
-                theta_half, v_half, acceleration, t + 0.5 * dt, step, 1)
+                theta_half, v_half, acceleration, t + 0.5 * dt, step, 1,
+                initial_velocity=parameter_velocity, dt=dt)
         # Both full updates start at n, including for the midpoint method.
         theta_new = theta_n + dt * parameter_velocity
         if self.args.time_integrator == "energy_conserving":
             # Keep theta_n at every velocity stage. Only the particle time
             # update changes; the score still uses one Euler/CG update at n.
+            def particle_stage(velocity, time, stage):
+                evaluation = self.evaluate(velocity, time)
+                if self.diagnostics is not None:
+                    self.diagnostics.state(theta_n, velocity, time, step, evaluation,
+                                           phase="particle_stage", stage=stage, dt=dt)
+                return evaluation
+
             v_new, _, gamma_squared, problematic = homogeneous_step(
-                v, t, dt, self.args.B,
-                lambda velocity, time, stage: self.evaluate(velocity, time),
+                v, t, dt, self.args.B, particle_stage,
                 time_integrator="energy_conserving", initial_evaluation=initial)
             count = int(jnp.sum(problematic))
             gamma_min = float(jnp.min(gamma_squared))
@@ -381,10 +441,14 @@ class ScoreEvolutionStepper:
         else:
             v_new = v + dt * acceleration
             count, gamma_min = 0, 1.0
+        if self.diagnostics is not None:
+            self.diagnostics.update(theta_n, theta_new, v, v_new, t, step, dt, gamma_min, count)
         if not bool(jnp.all(jnp.isfinite(theta_new))) or not bool(jnp.all(jnp.isfinite(v_new))):
             raise FloatingPointError(f"Nonfinite score-evolution state after t={t}")
         self.theta = theta_new
         nnx.update(self.model, self._unravel(theta_new))
+        # Commit the warm start only after the complete step succeeds.
+        self._previous_parameter_velocity = parameter_velocity
         return v_new, dict(optimization_steps=self.optimization_steps,
                            gamma_squared_min=gamma_min if math.isfinite(gamma_min) else None,
                            problematic_particle_count=count)
@@ -392,10 +456,12 @@ class ScoreEvolutionStepper:
     def summary(self):
         return dict(training_passes=0, linear_solves=self.linear_solves,
                     optimization_method="conjugate_gradient",
+                    score_evolution_cg_warm_start=True,
                     score_evolution_rhs=self.rhs_method,
                     score_evolution_cg_failure=self.args.score_evolution_cg_failure,
                     total_optimization_steps=self.total_optimization_steps,
                     unconverged_linear_solves=self.unconverged_linear_solves,
                     max_linear_relative_residual=self.max_linear_relative_residual,
+                    diagnostics=(self.diagnostics.summary() if self.diagnostics is not None else None),
                     score_evolution_bandwidth=(self.bandwidth.tolist()
                                                if self.bandwidth is not None else None))
