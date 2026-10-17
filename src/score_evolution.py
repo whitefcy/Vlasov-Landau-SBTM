@@ -23,13 +23,14 @@ from src.homogeneous import maxwell_collision, scott_bandwidth
 from src.time_integrators import homogeneous_step
 
 
-def add_score_evolution_arguments(parser):
+def add_score_evolution_arguments(parser, *, rhs_methods=("kernel", "transport", "transport_analytic")):
     group = parser.add_argument_group("score evolution")
-    group.add_argument("--score_evolution_rhs", choices=("kernel", "transport", "transport_analytic"), default="kernel",
-                       help="Eulerian score derivative R: Gaussian kernel approximation (default), "
-                            "transport equation using the score network, or transport_analytic "
-                            "using the analytical score at the current source particles and stage time; "
-                            "particle motion still uses the network")
+    rhs_help = ("Eulerian score derivative R: Gaussian kernel approximation (default) "
+                "or transport equation using the score network")
+    if "transport_analytic" in rhs_methods:
+        rhs_help += ("; transport_analytic uses the analytical score at the current "
+                     "source particles and stage time; particle motion still uses the network")
+    group.add_argument("--score_evolution_rhs", choices=rhs_methods, default="kernel", help=rhs_help)
     group.add_argument("--score_evolution_regularization", type=float, default=1e-4,
                        help="Positive lambda in sum_p w_p |J xi - R|^2 + lambda |xi|^2")
     group.add_argument("--score_evolution_bandwidth", type=float, nargs="+", default=None,
@@ -44,7 +45,7 @@ def add_score_evolution_arguments(parser):
                        help="Action when CG misses its residual tolerance: warn and continue "
                             "(default), or error before applying the parameter update")
     group.add_argument("--score_evolution_diagnostics_every", type=int, default=0,
-                       help="Trace score/parameter/RHS amplitudes, derivatives and analytic controls "
+                       help="Trace score/parameter/RHS amplitudes, derivatives and available analytic controls "
                             "every N steps (1 for onset tracing, 0 disables; adds derivative work)")
 
 

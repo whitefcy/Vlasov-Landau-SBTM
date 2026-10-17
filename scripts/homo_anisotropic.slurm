@@ -22,8 +22,16 @@
 #   sbatch scripts/homo_anisotropic.slurm --score_methods sbtm blob
 # The higher-dimensional example is opt-in:
 #   sbatch scripts/homo_anisotropic.slurm --dv 10 --n_values 100 200 400 800 1600 3200 6400 12800 25600
-# Supported score methods are sbtm and blob; BKW's exact-score and
-# score-evolution options are not implemented by the anisotropic driver.
+# Score evolution supports kernel (default) and learned transport RHS choices:
+#   sbatch scripts/homo_anisotropic.slurm --score_methods score_evolution --score_evolution_rhs kernel
+#   sbatch scripts/homo_anisotropic.slurm --score_methods score_evolution --score_evolution_rhs transport
+# Sweep ridge values in separate lambda directories, as in homo_BKW.slurm:
+#   sbatch scripts/homo_anisotropic.slurm --score_methods score_evolution --score_evolution_regularization 1e-4 1e-3 1e-2 0.1
+# Trace a transport pilot and stop before applying an unconverged CG solve:
+#   sbatch scripts/homo_anisotropic.slurm --score_methods score_evolution --n_values 100 --score_evolution_rhs transport --score_evolution_diagnostics_every 1 --score_evolution_cg_failure error
+# transport defaults to tanh; use --sbtm_activation tanh with kernel to match.
+# forward_euler and midpoint are also supported for score evolution.
+# No exact-score or transport_analytic mode is available for this example.
 set -eo pipefail
 cd "${SLURM_SUBMIT_DIR:?Submit this script from the repository root}"
 export MPLBACKEND=Agg
@@ -35,12 +43,57 @@ conda activate vlsbtm
 N_VALUES=(100 200 400 800 1600 3200 6400 12800)
 SCORE_METHODS=(sbtm)
 SEEDS=(42) # Add independent seeds to average curves and final errors.
+REGULARIZATION_VALUES=(1e-4)
 output_dir="data/homo_anisotropic/sweep_job${SLURM_JOB_ID}_restart${SLURM_RESTART_COUNT:-0}"
+
+# Consume launcher-level overrides so each lambda has its own output directory.
+extra_args=()
+while (( $# )); do
+  case "$1" in
+    --score_evolution_regularization)
+      shift
+      REGULARIZATION_VALUES=()
+      while (( $# )) && [[ "$1" != --* ]]; do
+        REGULARIZATION_VALUES+=("$1")
+        shift
+      done
+      if (( ${#REGULARIZATION_VALUES[@]} == 0 )); then
+        echo "--score_evolution_regularization requires at least one lambda" >&2
+        exit 2
+      fi
+      ;;
+    --score_evolution_regularization=*)
+      REGULARIZATION_VALUES=("${1#*=}")
+      shift
+      ;;
+    --output_dir)
+      if (( $# < 2 )) || [[ "$2" == --* ]]; then
+        echo "--output_dir requires a directory" >&2
+        exit 2
+      fi
+      output_dir="$2"
+      shift 2
+      ;;
+    --output_dir=*)
+      output_dir="${1#*=}"
+      shift
+      ;;
+    *)
+      extra_args+=("$1")
+      shift
+      ;;
+  esac
+done
 
 # Preserve Slurm's CUDA_VISIBLE_DEVICES; do not override it with --gpu.
 # Fit the initial Gaussian score on 12,800 independent samples for every n.
 # The sweep runner records failed runs and assembles figures from successes.
-srun python3 -u experiments/homo_benchmark.py run \
+# Score evolution uses CG after initialization; SBTM training flags apply only
+# to SBTM. The energy-conserving score update uses one solve per time step.
+status=0
+for regularization in "${REGULARIZATION_VALUES[@]}"; do
+  echo "Starting anisotropic sweep with lambda=${regularization}"
+  if srun python3 -u experiments/homo_benchmark.py run \
   --example anisotropic \
   --n_values "${N_VALUES[@]}" \
   --score_methods "${SCORE_METHODS[@]}" \
@@ -51,6 +104,8 @@ srun python3 -u experiments/homo_benchmark.py run \
   --final_time 4.0 \
   --dt 0.01 \
   --time_integrator energy_conserving \
+  --score_evolution_rhs kernel \
+  --score_evolution_regularization "$regularization" \
   --sbtm_hidden_dims 100 100 \
   --sbtm_n_initial 12800 \
   --sbtm_lr 0.0004 \
@@ -63,6 +118,14 @@ srun python3 -u experiments/homo_benchmark.py run \
   --sbtm_use_batches \
   --sbtm_num_batch_steps 100 \
   --snapshot_every 100 \
-  --output_dir "$output_dir" \
+  --output_dir "${output_dir}/lambda_${regularization}" \
   --wandb_mode "${WANDB_MODE:-disabled}" \
-  "$@"
+  "${extra_args[@]}"; then
+    echo "Finished anisotropic sweep with lambda=${regularization}"
+  else
+    sweep_status=$?
+    echo "Anisotropic sweep with lambda=${regularization} failed (exit ${sweep_status}); continuing." >&2
+    status=1
+  fi
+done
+exit "$status"

@@ -243,7 +243,15 @@ def save_diagnostic_plot(input_dir, output_dir=None):
     ]
     fig, axes = plt.subplots(4, 2, figsize=(14, 16), constrained_layout=True)
     bad_time = next((float(row["time"]) for row in rows if row["nonfinite_fields"]), None)
+    has_reference = any(row.get("score_error_rms") for row in rows)
     for index, (ax, (title, phase, fields)) in enumerate(zip(axes.flat, panels)):
+        if not has_reference and index == 4:
+            title = "Score Jacobian antisymmetry"
+        if not has_reference and index == 6:
+            ax.text(0.5, 0.5, "Score error production unavailable\nRequires an analytical score reference",
+                    ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            continue
         for name, label in fields:
             selected = [r for r in rows if r.get(name) and (phase is None or r["phase"] == phase)]
             # Do not mix solve-time and endpoint values in the same increment curve.
